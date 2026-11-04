@@ -1,0 +1,31 @@
+# 本地联调配置（配合 cmd/mock 使用）
+active: true
+dbPath: /tmp/cp-test.db
+logLevel: debug
+
+upf:
+  baseURL: http://127.0.0.1:18153
+  user: ehgw
+  pwdMD5: "04f5349605824dec612bd1493efdc923"
+  callbackURL: http://127.0.0.1:18080/ue/callback
+  tokenTTLMin: 30
+  tokenRefreshBeforeSec: 300
+  pingIntervalSec: 5
+  timeoutSec: 5
+
+callback:
+  listen: 127.0.0.1:18080
+  path: /ue/callback
+
+oam:
+  listen: 127.0.0.1:10001
+  path: /cp/v1/common/call
+
+up:
+  socket: unix:///tmp/mock-up.sock
+  snapshotBatchSize: 500
+  timeoutSec: 5
+  maxRetry: 3
+
+sessions:
+  pageStep: 10
