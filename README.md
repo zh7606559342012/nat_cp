@@ -56,6 +56,59 @@ internal/
 - 当前实现 IPv4（Q3），SNAT 分配策略与重复 UPSERT 是否保持原 IP
   待联调冻结（Q2）。
 
+## 启动使用
+
+### 方式一：本地直接跑（开发联调用）
+
+```bash
+go build -o cp ./cmd/cp
+./cp -config configs/cp.yaml          # 生产示例配置，先改里面的 UPF 地址和 pwdMD5
+./cp -config configs/cp-test.yaml     # 联调配置，配合 cmd/mock 使用
+```
+
+### 方式二：打包部署到目标机（仿 jxtx 的 make_package/install 流程）
+
+```bash
+# 1. 在开发机上打包（需要 Go 环境），得到 natcp_setup_v0.1.tar.gz
+#    注意：从 git 刚拉下来的脚本可能没有执行权限，先 chmod 一次
+chmod +x make_package.sh install.sh upgrade.sh scripts/*
+./make_package.sh v0.1
+
+# 2. 把 tar.gz 传到目标机，解压后执行安装（需 root）
+tar -xzf natcp_setup_v0.1.tar.gz
+cd natcp_setup_v0.1
+./install.sh
+```
+
+安装完成后程序在 `/opt/nat_cp/bin/cp`，配置在
+`/opt/nat_cp/bin/conf/cp.yaml`（首次安装装的是示例配置，**启动前
+务必先改** `upf.baseURL`、`upf.pwdMD5`（32 位小写 MD5，不要放明文密码）、
+`upf.callbackURL` 和 `up.socket`），systemd 服务名为 `natcp`，开机自启。
+
+### 启停、状态、日志、升级、卸载
+
+```bash
+cpctl start            # 启动（等价于 scripts/start_all.sh）
+cpctl stop             # 停止（等价于 scripts/stop_all.sh）
+cpctl restart          # 重启
+cpctl status           # 看状态（等价于 scripts/status_all.sh）
+journalctl -u natcp -f # 跟日志（systemd 模式）
+
+# 升级：新包解压后执行（默认自动重启；--no-start 只替换不重启）
+./upgrade.sh
+./upgrade.sh --no-start
+
+# 卸载
+systemctl disable --now natcp
+rm -rf /opt/nat_cp /usr/local/bin/cpctl /usr/lib/systemd/system/natcp.service
+# 配置、SQLite（/var/lib/fusion-access-gw/cp.db）、日志按需保留或删除
+```
+
+说明：`cpctl` 在有 systemd 的目标机上走 `systemctl`；在没有 systemd
+的开发机/容器里自动退化为 pidfile 模式（nohup 后台运行），
+可用 `NATCP_HOME`、`NATCP_CONFIG`、`NATCP_PIDFILE`、`NATCP_LOGFILE`
+环境变量覆盖默认路径。
+
 ## 构建与运行
 
 ```bash
