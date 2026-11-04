@@ -6,7 +6,8 @@
 #   ./upgrade.sh --no-start # 只替换文件，不重启（-u 同义）
 #
 # 行为：停服务 → 备份旧配置到 /home/natcp_conf → 替换二进制与脚本 →
-# 恢复旧配置 →（默认）重启服务。配置文件、SQLite 数据库与日志不动。
+# 恢复旧配置 → 刷新 systemd 单元 →（默认）重启服务。
+# 配置文件、SQLite 数据库与日志不动。
 set -e
 
 CUR_PATH="$(dirname "$(readlink -f "$0")")"
@@ -38,6 +39,29 @@ done
 [ "$(id -u)" = "0" ] || die "upgrade.sh must run as root"
 [ -f "${CUR_PATH}/bin/cp" ] || die "bin/cp not found, run inside the extracted package dir"
 
+_gen_natcp_service() {
+cat << EOF > /usr/lib/systemd/system/natcp.service
+[Unit]
+Description=Fusion Access GW Control Plane
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${NATCP_BIN}/cp -config ${NATCP_CONF_DIR}/cp.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload 2>/dev/null || true
+}
+
 # 停服务并备份旧配置（仿 jxtx upgrade.sh 的 env_check）
 if command -v systemctl >/dev/null 2>&1; then
     systemctl stop "${SERVICE_NAME}" >/dev/null 2>&1 || true
@@ -59,10 +83,7 @@ fi
 if [ -f "${CUR_PATH}/bin/conf/cp_version.txt" ]; then
     cp -f "${CUR_PATH}/bin/conf/cp_version.txt" "${NATCP_CONF_DIR}/"
 fi
-if [ -f "${CUR_PATH}/deployments/natcp.service" ]; then
-    cp -f "${CUR_PATH}/deployments/natcp.service" /usr/lib/systemd/system/natcp.service
-    systemctl daemon-reload 2>/dev/null || true
-fi
+_gen_natcp_service
 
 if [[ "${NoAutoStart}" -eq 0 ]]; then
     systemctl restart "${SERVICE_NAME}"

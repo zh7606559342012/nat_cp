@@ -1,6 +1,7 @@
 #!/bin/bash
 # 安装脚本（仿 jxtx install.sh 的流程，针对 CP 精简：CP 不需要 redis、
-# td-agent、ncpa、ntp 等 jxtx agent 的依赖，只装 CP 自身）。
+# td-agent、ncpa、ntp 等 jxtx agent 的依赖，只装 CP 自身；
+# systemd 单元文件仿 jxtx _gen_agent_service 由本脚本现场生成）。
 #
 # 用法（在解压后的安装包目录内执行，需 root）：
 #   ./install.sh
@@ -33,7 +34,6 @@ die() {
 
 [ "$(id -u)" = "0" ] || die "install.sh must run as root"
 [ -f "${CUR_PATH}/bin/cp" ] || die "bin/cp not found, run inside the extracted package dir"
-[ -f "${CUR_PATH}/deployments/natcp.service" ] || die "deployments/natcp.service not found"
 
 env_check() {
     # 停掉旧服务（若存在），备份旧配置
@@ -69,8 +69,26 @@ install_cp() {
     ln -sf "${NATCP_ROOT}/scripts/cpctl" /usr/local/bin/cpctl
 }
 
-install_service() {
-    cp -f "${CUR_PATH}/deployments/natcp.service" /usr/lib/systemd/system/natcp.service
+_gen_natcp_service() {
+cat << EOF > /usr/lib/systemd/system/natcp.service
+[Unit]
+Description=Fusion Access GW Control Plane
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=${NATCP_BIN}/cp -config ${NATCP_CONF_DIR}/cp.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
     systemctl daemon-reload
     systemctl enable "${SERVICE_NAME}"
 }
@@ -90,7 +108,7 @@ EOF
 
 env_check
 install_cp
-install_service
+_gen_natcp_service
 install_logrotate
 
 echo "starting ${SERVICE_NAME}..."

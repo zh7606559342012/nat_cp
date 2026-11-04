@@ -1,0 +1,40 @@
+# Fusion Access GW CP 配置示例
+# 生产部署时请按实际环境修改，并把 upf.pwdMD5 换成真实的 32 位小写 MD5。
+# 注意：配置文件中只放 MD5 值，不放明文密码。
+active: true
+dbPath: /var/lib/fusion-access-gw/cp.db
+logLevel: info
+
+upf:
+  # UPF 北向地址（含协议与端口，生产为 https://<UPF-IP>:8153）
+  baseURL: https://10.216.4.160:8153
+  user: ehgw
+  pwdMD5: "00000000000000000000000000000000" # 替换为真实 MD5
+  # CP 提供给 UPF 的回调地址：UPF 用 POST 向该地址推送 UE create/delete。
+  # 必须是 UPF 能访问到的地址（含 CP 监听端口与回调路径）。
+  callbackURL: http://10.0.0.10:8080/ue/callback
+  tokenTTLMin: 30
+  tokenRefreshBeforeSec: 300
+  pingIntervalSec: 30
+  timeoutSec: 10
+
+callback:
+  listen: 0.0.0.0:8080
+  path: /ue/callback
+
+oam:
+  listen: 127.0.0.1:10001
+  path: /cp/v1/common/call
+
+up:
+  # CP-UP socket Endpoint（说明书 6.1.1，建议 UDS）
+  socket: unix:///var/run/fusion-access-gw/up.sock
+  snapshotBatchSize: 500 # 允许 100~1000
+  timeoutSec: 10
+  maxRetry: 3
+
+sessions:
+  pageStep: 100
+
+pprof:
+  listen: 127.0.0.1:17070

@@ -3,13 +3,13 @@
 set -u
 cd ~/workspace/nat_cp
 export PATH=$HOME/go-sdk/bin:$PATH
-go build -o /tmp/mock ./cmd/mock
-go build -o /tmp/cp ./cmd/cp
+go build -o /tmp/mock ./main/mock
+go build -o /tmp/cp ./main
 rm -f /tmp/cp-test.db* /tmp/mock-up.sock
 
 /tmp/mock > /tmp/mock.log 2>&1 &
 MOCK_PID=$!
-/tmp/cp -config configs/cp-test.yaml > /tmp/cp.log 2>&1 &
+/tmp/cp -config main/conf/cp-test.yaml > /tmp/cp.log 2>&1 &
 CP_PID=$!
 trap 'kill $MOCK_PID $CP_PID 2>/dev/null; echo "--- cp.log tail ---"; tail -30 /tmp/cp.log' EXIT
 sleep 3

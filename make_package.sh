@@ -11,7 +11,6 @@
 #     bin/conf/cp_version.txt 打包版本
 #     scripts/cpctl          启停/status 统一入口
 #     scripts/start_all.sh / stop_all.sh / status_all.sh
-#     deployments/natcp.service  systemd 单元文件
 #     install.sh / upgrade.sh
 #     README.md
 #
@@ -33,13 +32,14 @@ usage() {
 }
 
 [ -n "${VERSION}" ] || usage
-command -v go >/dev/null 2>&1 || die "go toolchain not found in PATH"
+command -v go >/dev/null 2>&1 || die "go toolchain not found in PATH (run ./initial_compile.sh first)"
 
 compile_code() {
-    cd "${CURRENT_PATH}"
+    cd "${CURRENT_PATH}/main"
     go env -w GO111MODULE=on
+    go env -w GOPROXY=https://goproxy.cn,direct
     go mod tidy
-    CGO_ENABLED=1 go build -trimpath -o cp ./cmd/cp
+    go build -ldflags "-X 'main.Version=${VERSION}'" -o cp .
     [ -f cp ] || die "go build failed"
     cd "${CURRENT_PATH}"
 }
@@ -52,22 +52,16 @@ package_all() {
     [ -d "${PKG_PATHNAME}" ] && rm -rf "${PKG_PATHNAME}"
     mkdir -p "${PKG_PATHNAME}/bin/conf"
     mkdir -p "${PKG_PATHNAME}/scripts"
-    mkdir -p "${PKG_PATHNAME}/deployments"
 
     # bin
-    cp "${CURRENT_PATH}/cp" "${PKG_PATHNAME}/bin/"
+    cp "${CURRENT_PATH}/main/cp" "${PKG_PATHNAME}/bin/"
     chmod +x "${PKG_PATHNAME}/bin/cp"
     # conf（安装时若已有配置则不覆盖，见 install.sh）
-    cp "${CURRENT_PATH}/configs/cp.yaml" "${PKG_PATHNAME}/bin/conf/"
+    cp "${CURRENT_PATH}/main/conf/cp.yaml" "${PKG_PATHNAME}/bin/conf/"
     echo "${VERSION}" > "${PKG_PATHNAME}/bin/conf/cp_version.txt"
-    # scripts
-    cp "${CURRENT_PATH}/scripts/cpctl" "${PKG_PATHNAME}/scripts/"
-    cp "${CURRENT_PATH}/scripts/start_all.sh" "${PKG_PATHNAME}/scripts/"
-    cp "${CURRENT_PATH}/scripts/stop_all.sh" "${PKG_PATHNAME}/scripts/"
-    cp "${CURRENT_PATH}/scripts/status_all.sh" "${PKG_PATHNAME}/scripts/"
+    # scripts（源自 main/scripts，与 jxtx 的 main/scripts 对应）
+    cp "${CURRENT_PATH}/main/scripts/"* "${PKG_PATHNAME}/scripts/"
     chmod +x "${PKG_PATHNAME}/scripts/"*
-    # systemd unit
-    cp "${CURRENT_PATH}/deployments/natcp.service" "${PKG_PATHNAME}/deployments/"
     # top-level
     cp "${CURRENT_PATH}/install.sh" "${PKG_PATHNAME}/"
     cp "${CURRENT_PATH}/upgrade.sh" "${PKG_PATHNAME}/"
@@ -81,4 +75,4 @@ package_all() {
 compile_code
 package_all
 # 清理构建产物，不进包
-rm -f "${CURRENT_PATH}/cp"
+rm -f "${CURRENT_PATH}/main/cp"
