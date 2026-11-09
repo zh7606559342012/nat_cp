@@ -27,4 +27,11 @@ fi
 
 go env -w GO111MODULE=on
 go env -w GOPROXY=https://goproxy.cn,direct
+
+# SQLite 驱动 mattn/go-sqlite3 是 CGO 库，没有 gcc 会编成 stub：
+# 编译通过、打包成功，但目标机启动时报 "requires cgo"。在这里先卡住。
+command -v gcc >/dev/null 2>&1 \
+    || die "gcc not found: mattn/go-sqlite3 needs CGO. run: sudo apt-get install -y build-essential"
+
 echo "go ${GO_VERSION} ready (GO111MODULE=on, GOPROXY=https://goproxy.cn,direct)"
+echo "target: $(go env GOOS)/$(go env GOARCH)   gcc: $(gcc -dumpmachine)"

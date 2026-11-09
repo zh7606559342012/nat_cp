@@ -7,6 +7,7 @@ package httpServer
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -16,7 +17,12 @@ var DB *sql.DB
 
 // DbConnInit 打开数据库并执行 PRAGMA 与建表（说明书 10.2）。
 func DbConnInit(path string) error {
-	dsn := fmt.Sprintf("file:%s?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000", path)
+	// Windows 下路径是反斜杠，统一成正斜杠再拼 DSN：
+	// file: 形式按 URL 解析，反斜杠会被当成转义或截断。
+	dsn := fmt.Sprintf(
+		"file:%s?cache=shared&mode=rwc&_journal_mode=WAL&_synchronous=NORMAL&_foreign_keys=ON&_busy_timeout=5000",
+		strings.ReplaceAll(path, "\\", "/"),
+	)
 	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return fmt.Errorf("open sqlite %s: %w", path, err)

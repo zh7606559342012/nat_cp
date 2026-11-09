@@ -1,0 +1,18 @@
+# 本地构建产物
+/bin/
+# 本地联调数据（SQLite 库、UDS socket、日志）
+/data/
+*.exe
+
+# dlv 调试时生成的临时二进制
+__debug_bin*
+
+# 本机开发辅助文件：内容绑定本机路径（D:\go1.22、D:\mingw64、仓库绝对路径），
+# 换一台机器就不成立，因此只留本地，不入库。
+.idea
+/.vscode/
+/dev-win.bat
+/main/conf/cp-win.yaml
+
+# 工作区辅助目录（会话记忆等），不入库
+/.workbuddy/

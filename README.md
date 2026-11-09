@@ -111,21 +111,101 @@ go build -o cp ./main
 ### 方式二：打包部署到目标机（仿 jxtx 的 make_package/install 流程）
 
 ```bash
-# 1. 在开发机上打包（需要 Go 环境），得到 natcp_setup_v0.1.tar.gz
+# 1. 在开发机上打包（需要 Go 环境），得到 fagw-cp_setup_v0.1.tar.gz
 #    注意：从 git 刚拉下来的脚本可能没有执行权限，先 chmod 一次
 chmod +x make_package.sh install.sh upgrade.sh initial_compile.sh main/scripts/*
 ./make_package.sh v0.1
 
 # 2. 把 tar.gz 传到目标机，解压后执行安装（需 root）
-tar -xzf natcp_setup_v0.1.tar.gz
-cd natcp_setup_v0.1
+tar -xzf fagw-cp_setup_v0.1.tar.gz
+cd fagw-cp_setup_v0.1
 ./install.sh
 ```
 
-安装完成后程序在 `/opt/nat_cp/bin/cp`，配置在
-`/opt/nat_cp/bin/conf/cp.yaml`（首次安装装的是示例配置，**启动前
+安装完成后程序在 `/opt/fagw/fagw-cp/bin/cp`（与 OAM 的 `/opt/fagw/fagw-oam` 同级），配置在
+`/opt/fagw/fagw-cp/bin/conf/cp.yaml`（首次安装装的是示例配置，**启动前
 务必先改** `upf.baseURL`、`upf.pwdMD5`（32 位小写 MD5，不要放明文密码）、
-`upf.callbackURL` 和 `up.socket`），systemd 服务名为 `natcp`，开机自启。
+`upf.callbackURL` 和 `up.socket`），systemd 服务名为 `fagw-cp`，开机自启，
+日志在 `/var/log/fagw-cp`。从旧版本（`/opt/nat_cp` + `natcp.service`）升级会自动
+停用旧服务并沿用旧配置。
+
+### 方式三：Windows 本地开发
+
+本地与生产用**同一个驱动**（`mattn/go-sqlite3`，CGO），不存在“本地通过、上线行为不同”的问题。
+代价是构建机必须有 gcc，所以 **Windows 只负责开发，出包统一在 Ubuntu 上做**。
+
+| 依赖 | 要求 |
+|---|---|
+| Go | 1.22+（本机放在 `D:\go1.22`） |
+| gcc | MinGW-w64，x86_64 目标（本机放在 `D:\mingw64`，GCC 16.2.0） |
+| 不能用 | MinGW.org 32 位发行版（如 `D:\MinGW`，无法作为 64 位 Go 的 CGO 编译器） |
+
+> **本机辅助文件不入库**：`dev-win.bat`、`main/conf/cp-win.yaml`、`.vscode/` 内含
+> `D:\go1.22`、`D:\mingw64`、仓库绝对路径等硬编码，换一台机器就不成立，已被 `.gitignore` 排除。
+> 换机器时按下面约定自建。
+
+等价的手工命令（Git Bash）：
+
+```bash
+export CGO_ENABLED=1 GOTOOLCHAIN=local
+export PATH="/d/mingw64/bin:/d/go1.22/go/bin:$PATH"
+go build -o bin/cp.exe   ./main
+go build -o bin/mock.exe ./main/mock
+```
+
+启动顺序与端口：mock UPF `18153`、mock UP UDS `data/up.sock`、
+CP `18080`（UE 回调）/ `10001`（OAM）/ `17070`（pprof）。
+
+`cp-win.yaml` 有两个 Windows 专属的坑：
+
+1. `dbPath` 写**相对路径**（`data/cp.db`）——`file:` DSN 按 URL 解析，`D:/x` 会被当成
+   scheme 截断；相对路径最稳，所以启动时 cwd 必须是仓库根目录。
+2. `up.socket` 写 **Windows 绝对路径**（`unix://D:\...\data\up.sock`），且必须与 mock 的
+   `-up-sock` 完全一致——AF_UNIX 在 Windows 上要求文件系统路径，`/tmp/xxx` 会落到当前盘符根目录下。
+
+首次编译约 2 分钟（全量编译 `sqlite3.c`），之后走编译缓存。日志落在 `data\`（已忽略）。
+
+> 因为用 CGO，**不能**在 Windows 上交叉编译出 Linux 二进制（MinGW 只产出 Windows 目标）。
+> 出包在目标架构的 Ubuntu 上执行 `./initial_compile.sh && ./make_package.sh v0.1`。
+
+### 断点调试（VSCode）
+
+本地 `.vscode/launch.json`（不入库）里配两个 launch 配置 + 一个 compound
+**CP + mock（本地全链路）**，F5 即可同时以调试模式拉起两进程，断点可以直接打在
+`handler` / `upf` / `up` 任何位置。执行顺序上 mock 先起、CP 后起；CP 首次 dial 若失败会自动重试，
+日志里几条 `get upf token failed` 属正常。
+
+两个要点：
+
+- 两进程读不同配置——CP 用 `main/conf/cp-win.yaml`，mock 用 `-up-sock` 指向同一个 socket。
+- debug 配置的 `env` 必须带上 `CGO_ENABLED=1`、`GOTOOLCHAIN=local`、`PATH` 含 mingw 的 `bin`，
+  否则 dlv 会用系统里的旧 Go 编译，报一堆找不到 `sqlite3.h` 的错。
+
+前提是 dlv 与 Go 版本匹配：**dlv ≤ 1.21 不支持 Go 1.22**，会报
+`Version of Delve is too old for Go version 1.22.12`（默认不打日志，表现为静默退出）。升级：
+
+```bash
+go install github.com/go-delve/delve/cmd/dlv@v1.24.2
+```
+
+
+### 联调怎么造场景
+
+三个 mock 辅助接口就是"人造流量"的入口：
+
+```bash
+# 看假 UPF/假 UP 的内部状态
+curl --noproxy '*' http://127.0.0.1:18153/__mock/state
+# 看 UP 已安装的规则（CP 下发了什么）
+curl --noproxy '*' http://127.0.0.1:18153/__mock/up/rules
+# 模拟 UE 上线 / 下线（向 CP 的回调地址推送）
+curl --noproxy '*' -X POST http://127.0.0.1:18153/__mock/trigger \
+     -d '{"action":"create","imsi":"460001111111111","dnn":"area1","privateIpv4":"20.20.1.1"}'
+curl --noproxy '*' -X POST http://127.0.0.1:18153/__mock/trigger \
+     -d '{"action":"delete","imsi":"460001111111111","dnn":"area1","privateIpv4":"20.20.1.1"}'
+```
+
+OAM 侧（10001）用同一套 `call` 接口下发静态配置，完整例子见 `smoke_test.sh`。
 
 ### 启停、状态、日志、升级、卸载
 
@@ -134,15 +214,15 @@ cpctl start            # 启动（等价于 main/scripts/start_all.sh）
 cpctl stop             # 停止（等价于 main/scripts/stop_all.sh）
 cpctl restart          # 重启
 cpctl status           # 看状态（等价于 main/scripts/status_all.sh）
-journalctl -u natcp -f # 跟日志（systemd 模式）
+journalctl -u fagw-cp -f # 跟日志（systemd 模式）
 
 # 升级：新包解压后执行（默认自动重启；--no-start 只替换不重启）
 ./upgrade.sh
 ./upgrade.sh --no-start
 
 # 卸载
-systemctl disable --now natcp
-rm -rf /opt/nat_cp /usr/local/bin/cpctl /usr/lib/systemd/system/natcp.service
+systemctl disable --now fagw-cp
+rm -rf /opt/fagw/fagw-cp /usr/local/bin/cpctl /usr/lib/systemd/system/fagw-cp.service
 # 配置、SQLite（/var/lib/fusion-access-gw/cp.db）、日志按需保留或删除
 ```
 
@@ -171,6 +251,11 @@ bash smoke_test.sh
 # 1. OAM 下发 ToH 配置：VNI 范围 + IMSI 绑定（area1）
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"t1","command":"add_vxlan","reqArgs":{"id":"vx1","vniBegin":100,"vniEnd":199,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.0.0/24"}}'
+# 1.1 修改已有配置：全量下发（缺字段会被拒），但 VNI 范围不可改；
+#     换范围须先 del_vxlan 再 add_vxlan，并重新下发该范围内的绑定；
+#     del_vxlan 仅当该 VNI 范围内已无 imsi 绑定时才成功，否则报错提示先删绑定
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"t1b","command":"mod_vxlan","reqArgs":{"id":"vx1","vniBegin":100,"vniEnd":199,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.9.0/24"}}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"t2","command":"add_vxlan_imsi","reqArgs":{"id":"b1","imsi":"460001111111111","dnn":"area1","vni":100}}'
 # 触发 area1 定向全量补偿：mock 中 area1 已在线的 20.20.1.1 应被安装

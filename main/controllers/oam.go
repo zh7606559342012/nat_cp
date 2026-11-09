@@ -15,10 +15,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 
-	"natcp/main/handler"
-	"natcp/main/webTypes"
 	"natcp/main/conf"
+	"natcp/main/handler"
 	"natcp/main/models"
+	"natcp/main/webTypes"
 )
 
 // OAMServer 是 OAM 配置服务。路由注册在 server 包。
@@ -119,20 +119,28 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 	args := req.ReqArgs
 	switch req.Command {
 	// ---- VXLAN 范围配置 ----
-	case "add_vxlan", "mod_vxlan":
+	// add 与 mod 分开：add 只新增（id 已存在报错），mod 只修改且 VNI 范围不可变。
+	case "add_vxlan":
 		var a vxlanArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, nil, err
 		}
 		cfg := a.toModel()
-		if err := s.repo.UpsertVxlan(cfg); err != nil {
+		if err := s.repo.AddVxlan(cfg); err != nil {
 			return nil, nil, err
 		}
-		op := "ADD"
-		if req.Command == "mod_vxlan" {
-			op = "MODIFY"
+		return s.eventForVxlanRange("ADD", cfg.VNIBegin, cfg.VNIEnd), nil, nil
+	case "mod_vxlan":
+		var a vxlanArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, nil, err
 		}
-		return s.eventForVxlanRange(op, cfg.VNIBegin, cfg.VNIEnd), nil, nil
+		cfg := a.toModel()
+		if err := s.repo.ModifyVxlan(cfg); err != nil {
+			return nil, nil, err
+		}
+		// 范围已由 ModifyVxlan 保证与库中一致，可直接用下发值定位受影响绑定。
+		return s.eventForVxlanRange("MODIFY", cfg.VNIBegin, cfg.VNIEnd), nil, nil
 	case "del_vxlan":
 		var a struct {
 			ID string `json:"id"`
@@ -140,18 +148,14 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, nil, err
 		}
-		// 删除前先取范围，用于定位受影响绑定。
-		var begin, end uint32
-		for _, vc := range mustList(s.repo.ListVxlanConfigs()) {
-			if vc.ID == a.ID {
-				begin, end = vc.VNIBegin, vc.VNIEnd
-			}
-		}
-		if err := s.repo.DeleteVxlan(a.ID); err != nil {
+		// 范围内仍有 ToH 绑定时 DeleteVxlan 拒绝删除并给出提示；
+		// 成功时返回被删配置，用其范围定位受影响会话。
+		cfg, err := s.repo.DeleteVxlan(a.ID)
+		if err != nil {
 			return nil, nil, err
 		}
-		return s.eventForVxlanRange("DELETE", begin, end), nil, nil
-	case "query_vxlan":
+		return s.eventForVxlanRange("DELETE", cfg.VNIBegin, cfg.VNIEnd), nil, nil
+	case "list_vxlan":
 		return nil, mustList(s.repo.ListVxlanConfigs()), nil
 
 	// ---- ToH IMSI 绑定 ----
@@ -170,7 +174,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		return &webTypes.ConfigChangedEvent{Op: op,
 			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
 	case "batch_add_vxlan_imsi":
-		list, err := parseBindingList[models.VxlanImsiBinding](args, func(a vxlanBindingArgs) models.VxlanImsiBinding {
+		list, err := parseList[models.VxlanImsiBinding](args, "bindings", func(a vxlanBindingArgs) models.VxlanImsiBinding {
 			return a.toModel()
 		})
 		if err != nil {
@@ -190,7 +194,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		}
 		return &webTypes.ConfigChangedEvent{Op: "DELETE",
 			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
-	case "query_vxlan_imsi":
+	case "list_vxlan_imsi":
 		return nil, mustList(s.repo.ListVxlanBindings()), nil
 
 	// ---- FTTR-B 配置 ----
@@ -208,6 +212,21 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 			op = "MODIFY"
 		}
 		return s.eventForFttrb(op, cfg.FttrbID), nil, nil
+	case "batch_add_fttrb":
+		list, err := parseList[models.FttrbConfig](args, "configs", func(a fttrbArgs) models.FttrbConfig {
+			return a.toModel()
+		})
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := s.repo.BatchAddFttrbConfigs(list); err != nil {
+			return nil, nil, err
+		}
+		ids := make([]string, 0, len(list))
+		for _, c := range list {
+			ids = append(ids, c.FttrbID)
+		}
+		return s.eventForFttrbIDs("BATCH", ids), nil, nil
 	case "del_fttrb":
 		var a struct {
 			ID string `json:"id"`
@@ -225,7 +244,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 			return nil, nil, err
 		}
 		return s.eventForFttrb("DELETE", fttrbID), nil, nil
-	case "query_fttrb":
+	case "list_fttrb":
 		return nil, mustList(s.repo.ListFttrbConfigs()), nil
 
 	// ---- ToB IMSI 绑定 ----
@@ -244,7 +263,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		return &webTypes.ConfigChangedEvent{Op: op,
 			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
 	case "batch_add_fttrb_imsi":
-		list, err := parseBindingList[models.FttrbImsiBinding](args, func(a fttrbBindingArgs) models.FttrbImsiBinding {
+		list, err := parseList[models.FttrbImsiBinding](args, "bindings", func(a fttrbBindingArgs) models.FttrbImsiBinding {
 			return a.toModel()
 		})
 		if err != nil {
@@ -264,7 +283,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		}
 		return &webTypes.ConfigChangedEvent{Op: "DELETE",
 			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
-	case "query_fttrb_imsi":
+	case "list_fttrb_imsi":
 		return nil, mustList(s.repo.ListFttrbBindings()), nil
 	}
 	return nil, nil, fmt.Errorf("unknown command %q", req.Command)
@@ -288,10 +307,20 @@ func (s *OAMServer) eventForVxlanRange(op string, begin, end uint32) *webTypes.C
 
 // eventForFttrb 找出引用该 FTTRB ID 的全部绑定，作为受影响键。
 func (s *OAMServer) eventForFttrb(op, fttrbID string) *webTypes.ConfigChangedEvent {
+	return s.eventForFttrbIDs(op, []string{fttrbID})
+}
+
+// eventForFttrbIDs 一次扫描绑定表，取出引用这批 FTTRB ID 的全部绑定。
+// 批量命令共用一次 ListFttrbBindings，避免每条配置扫一遍库。
+func (s *OAMServer) eventForFttrbIDs(op string, fttrbIDs []string) *webTypes.ConfigChangedEvent {
+	want := make(map[string]bool, len(fttrbIDs))
+	for _, id := range fttrbIDs {
+		want[id] = true
+	}
 	ev := &webTypes.ConfigChangedEvent{Op: op}
 	seen := map[string]bool{}
 	for _, b := range mustList(s.repo.ListFttrbBindings()) {
-		if b.FttrbID == fttrbID {
+		if want[b.FttrbID] {
 			ev.Keys = append(ev.Keys, webTypes.BindingKey{IMSI: b.IMSI, DNN: b.DNN})
 			if !seen[b.DNN] {
 				seen[b.DNN] = true
@@ -330,28 +359,32 @@ func listKeysFttrb(list []models.FttrbImsiBinding) []webTypes.BindingKey {
 	return out
 }
 
-// parseBindingList 解析批量绑定参数：既接受 {"bindings":[...]}，
-// 也接受裸数组 [...]。
-func parseBindingList[T any, A any](args json.RawMessage, conv func(A) T) ([]T, error) {
-	var wrapped struct {
-		Bindings []A `json:"bindings"`
-	}
-	if err := json.Unmarshal(args, &wrapped); err == nil && len(wrapped.Bindings) > 0 {
-		out := make([]T, 0, len(wrapped.Bindings))
-		for _, a := range wrapped.Bindings {
-			out = append(out, conv(a))
+// parseList 解析批量参数：既接受 {"<field>":[...]}，也接受裸数组 [...]。
+// field 是包装字段名，绑定类是 "bindings"，配置类是 "configs"。
+func parseList[T any, A any](args json.RawMessage, field string, conv func(A) T) ([]T, error) {
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(args, &probe); err == nil {
+		if raw, ok := probe[field]; ok {
+			var arr []A
+			if err := json.Unmarshal(raw, &arr); err != nil {
+				return nil, fmt.Errorf("invalid %q array: %w", field, err)
+			}
+			return convertList(arr, conv), nil
 		}
-		return out, nil
 	}
 	var arr []A
 	if err := json.Unmarshal(args, &arr); err != nil {
-		return nil, fmt.Errorf("invalid batch bindings: %w", err)
+		return nil, fmt.Errorf("invalid batch list (expect an array or {\"%s\":[...]}): %w", field, err)
 	}
+	return convertList(arr, conv), nil
+}
+
+func convertList[T any, A any](arr []A, conv func(A) T) []T {
 	out := make([]T, 0, len(arr))
 	for _, a := range arr {
 		out = append(out, conv(a))
 	}
-	return out, nil
+	return out
 }
 
 func mustList[T any](list []T, err error) []T {

@@ -5,8 +5,8 @@
 #   ./make_package.sh <version>     例如：./make_package.sh v0.1
 #
 # 产物：
-#   natcp_setup_<version>.tar.gz，解压后得到 natcp_setup_<version>/：
-#     bin/cp                 CP 主程序
+#   fagw-cp_setup_<version>.tar.gz，解压后得到 fagw-cp_setup_<version>/：
+#     bin/cp                 CP 主程序（安装到 /opt/fagw/fagw-cp/bin/cp）
 #     bin/conf/cp.yaml       生产配置示例（安装时不会覆盖已有配置）
 #     bin/conf/cp_version.txt 打包版本
 #     scripts/cpctl          启停/status 统一入口
@@ -38,15 +38,29 @@ compile_code() {
     cd "${CURRENT_PATH}/main"
     go env -w GO111MODULE=on
     go env -w GOPROXY=https://goproxy.cn,direct
-    go mod tidy
+
+    # SQLite 驱动 mattn/go-sqlite3 是 CGO 库。必须显式要求 CGO：
+    # CGO_ENABLED=0 时它会被编译成 stub —— 编译能过、打包能成，
+    # 直到目标机上启动才报 "Binary was compiled with 'CGO_ENABLED=0'",
+    # 属于最难排查的一类问题，所以这里提前卡死。
+    command -v gcc >/dev/null 2>&1 \
+        || die "gcc not found: mattn/go-sqlite3 needs CGO. run: sudo apt-get install -y build-essential"
+    export CGO_ENABLED=1
+
+    # 用 download 而不是 tidy：
+    # tidy 会重算依赖并改写 go.mod / go.sum，当构建机的 Go 版本高于开发机时
+    # 可能悄悄抬高 go 指令或升级间接依赖，导致开发机反而编不过。
+    go mod download
+
     go build -ldflags "-X 'main.Version=${VERSION}'" -o cp .
     [ -f cp ] || die "go build failed"
+    echo "built: $(go version | awk '{print $3}') / $(go env GOOS)/$(go env GOARCH) / CGO_ENABLED=$(go env CGO_ENABLED)"
     cd "${CURRENT_PATH}"
 }
 
 package_all() {
-    BINARY_FILENAME="natcp_setup_${VERSION}.tar.gz"
-    PKG_PATHNAME="natcp_setup_${VERSION}"
+    BINARY_FILENAME="fagw-cp_setup_${VERSION}.tar.gz"
+    PKG_PATHNAME="fagw-cp_setup_${VERSION}"
 
     [ -f "${BINARY_FILENAME}" ] && rm -f "${BINARY_FILENAME}"
     [ -d "${PKG_PATHNAME}" ] && rm -rf "${PKG_PATHNAME}"

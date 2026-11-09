@@ -1,0 +1,18 @@
+# 换行符策略
+# core.autocrlf=true 会把提交里的 LF 转成 CRLF，导致 .sh 在 Linux 上报
+#   /bin/bash^M: bad interpreter
+# 这里显式钉死：shell/go/yaml/md 一律 LF；Windows 批处理保持原样
+* text=auto
+
+*.sh   text eol=lf
+# scripts/ 下有无后缀的脚本（cpctl），同样必须是 LF，否则 Linux 上 bad interpreter
+main/scripts/* text eol=lf
+*.go   text eol=lf
+*.yaml text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf
+
+# dev-win.bat 是 GBK 编码（cmd 默认代码页 936），禁止任何换行/编码转换
+*.bat  -text

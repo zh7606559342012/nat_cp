@@ -118,7 +118,13 @@ type response struct {
 }
 
 func (m *mockUP) serve(sockPath string) error {
-	_ = os.Remove(sockPath)
+	// 上一个 mock 若是被强杀（taskkill / 关窗口），socket 文件会残留。
+	// Windows 上残留文件删除失败通常意味着还有进程占着它，此时 bind 会报
+	// "Only one usage of each socket address"，信息很难懂，所以提前讲清楚。
+	if err := os.Remove(sockPath); err != nil && !os.IsNotExist(err) {
+		fmt.Fprintf(os.Stderr, "warning: 无法删除残留 socket %s: %v\n"+
+			"         若随后 bind 失败，请先执行：taskkill /F /IM mock.exe\n", sockPath, err)
+	}
 	ln, err := net.Listen("unix", sockPath)
 	if err != nil {
 		return err
