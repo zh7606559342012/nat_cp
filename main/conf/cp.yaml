@@ -4,6 +4,7 @@
 active: true
 dbPath: /var/lib/fusion-access-gw/cp.db
 logLevel: info
+logPath: /var/log/fagw-cp/cp.log
 
 upf:
   # UPF 北向地址（含协议与端口，生产为 https://<UPF-IP>:8153）

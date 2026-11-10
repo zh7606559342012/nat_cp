@@ -126,7 +126,10 @@ cd fagw-cp_setup_v0.1
 `/opt/fagw/fagw-cp/bin/conf/cp.yaml`（首次安装装的是示例配置，**启动前
 务必先改** `upf.baseURL`、`upf.pwdMD5`（32 位小写 MD5，不要放明文密码）、
 `upf.callbackURL` 和 `up.socket`），systemd 服务名为 `fagw-cp`，开机自启，
-日志在 `/var/log/fagw-cp`。从旧版本（`/opt/nat_cp` + `natcp.service`）升级会自动
+日志由程序自己写到 `/var/log/fagw-cp/cp.log`（配置 `logPath`，install.sh 已配好
+logrotate：每天、保留 10 份、单份 20M、copytruncate，与 jxtx 的 agent.log
+策略一致）；systemd 的 journal 里只剩启动早期（读配置失败等）或日志
+文件打不开时的输出。从旧版本（`/opt/nat_cp` + `natcp.service`）升级会自动
 停用旧服务并沿用旧配置。
 
 ### 方式三：Windows 本地开发
@@ -214,7 +217,8 @@ cpctl start            # 启动（等价于 main/scripts/start_all.sh）
 cpctl stop             # 停止（等价于 main/scripts/stop_all.sh）
 cpctl restart          # 重启
 cpctl status           # 看状态（等价于 main/scripts/status_all.sh）
-journalctl -u fagw-cp -f # 跟日志（systemd 模式）
+tail -f /var/log/fagw-cp/cp.log # 跟日志（程序自己写文件，systemd / cpctl 两种模式通用）
+journalctl -u fagw-cp -f        # 只看 journal（启动早期输出，日志文件打不开时才有内容）
 
 # 升级：新包解压后执行（默认自动重启；--no-start 只替换不重启）
 ./upgrade.sh

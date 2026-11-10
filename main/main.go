@@ -33,7 +33,7 @@ func main() {
 	if err != nil {
 		logrus.WithError(err).Fatal("load config failed")
 	}
-	conf.InitLogger(cfg.LogLevel)
+	conf.InitLogger(cfg.LogLevel, cfg.LogPath)
 	logrus.WithField("version", Version).Info("natcp starting")
 
 	if err := httpServer.DbConnInit(cfg.DBPath); err != nil {

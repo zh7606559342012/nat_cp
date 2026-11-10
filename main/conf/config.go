@@ -15,6 +15,7 @@ type Config struct {
 	Active   bool   `yaml:"active"`   // 仅 Active CP 允许向 UP 写规则、向 UPF 注册订阅
 	DBPath   string `yaml:"dbPath"`   // SQLite 文件，默认 /var/lib/fusion-access-gw/cp.db
 	LogLevel string `yaml:"logLevel"` // debug / info / warn / error
+	LogPath  string `yaml:"logPath"`  // 程序日志文件，默认 /var/log/fagw-cp/cp.log；为空则只写 stderr
 
 	UPF struct {
 		BaseURL string `yaml:"baseURL"` // 如 https://10.216.4.160:8153；联调可用 http://127.0.0.1:18153
@@ -88,6 +89,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+	if c.LogPath == "" {
+		c.LogPath = "/var/log/fagw-cp/cp.log"
 	}
 	if c.UPF.TokenTTLMin <= 0 {
 		c.UPF.TokenTTLMin = 30

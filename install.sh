@@ -121,6 +121,8 @@ ${LOG_PATH}/cp.log {
     size 20M
     missingok
     notifempty
+    sharedscripts
+    delaycompress
     copytruncate
 }
 EOF
