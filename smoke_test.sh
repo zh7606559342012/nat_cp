@@ -1,7 +1,7 @@
 #!/bin/bash
 # nat_cp 本地联调冒烟脚本：mock UPF/UP + CP 全流程验证
 set -u
-cd ~/workspace/nat_cp
+cd "$(dirname "$0")"
 export PATH=$HOME/go-sdk/bin:$PATH
 go build -o /tmp/mock ./main/mock
 go build -o /tmp/cp ./main
