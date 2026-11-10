@@ -11,7 +11,7 @@ rm -f /tmp/cp-test.db* /tmp/mock-up.sock
 MOCK_PID=$!
 /tmp/cp -config main/conf/cp-test.yaml > /tmp/cp.log 2>&1 &
 CP_PID=$!
-trap 'kill $MOCK_PID $CP_PID 2>/dev/null; echo "--- cp.log tail ---"; tail -30 /tmp/cp.log' EXIT
+trap 'kill $MOCK_PID $CP_PID 2>/dev/null; echo "--- cp-test.log tail (CP 文件日志) ---"; tail -30 /tmp/cp-test.log' EXIT
 sleep 3
 
 oam() { curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d "$1"; echo; }

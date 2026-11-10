@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"strconv"
 
+	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
 )
 
@@ -43,4 +44,8 @@ func InitLogger(level, path string) {
 		return
 	}
 	logrus.SetOutput(f)
+	// gin 自己的输出（启动时打印的路由表等）也进同一个文件；
+	// 代码里没有其他日志出口：生产代码不用标准库 log、不直接写
+	// stdout/stderr，全部走全局 logrus。
+	gin.DefaultWriter = f
 }
