@@ -42,6 +42,30 @@ func New(upfCli *upf.Client, e *handler.Engine, callbackURL string, interval tim
 // SetSubscribed 更新订阅状态。
 func (m *Monitor) SetSubscribed(v bool) { m.subscribed.Store(v) }
 
+// verifySubscription 用 GET /ue/subscribe 核对 UPF 侧是否仍有本机回调订阅；
+// 丢失则补注册。只在链路恢复时调用，避免每次心跳都多一次查询。
+func (m *Monitor) verifySubscription(ctx context.Context) {
+	subs, err := m.upf.ListSubscribes(ctx)
+	if err != nil {
+		m.log.WithError(err).Warn("list subscribes failed, keep current state")
+		return
+	}
+	for _, s := range subs {
+		if s.URL == m.callbackURL {
+			m.subscribed.Store(true)
+			return
+		}
+	}
+	m.log.Warn("upf subscribe missing after link recovery, re-subscribing")
+	if err := m.upf.Subscribe(ctx, m.callbackURL, "fusion-access-gw cp"); err != nil {
+		m.log.WithError(err).Warn("subscribe retry failed")
+		m.subscribed.Store(false)
+		return
+	}
+	m.subscribed.Store(true)
+	m.log.Info("upf subscribe recovered")
+}
+
 // Start 阻塞运行心跳循环，直到 ctx 取消。
 func (m *Monitor) Start(ctx context.Context) {
 	ticker := time.NewTicker(m.interval)
@@ -66,6 +90,11 @@ func (m *Monitor) tick(ctx context.Context) {
 	m.engine.SetLinkDown(false)
 	if wasDown {
 		m.log.Info("upf link recovered")
+		// 链路恢复时核对 UPF 侧订阅是否还在：UPF 重启可能丢订阅，
+		// 而本地 subscribed 仍为 true，不核对就再也收不到 UE 事件。
+		if m.subscribed.Load() {
+			m.verifySubscription(ctx)
+		}
 	}
 	if !m.subscribed.Load() {
 		if err := m.upf.Subscribe(ctx, m.callbackURL, "fusion-access-gw cp"); err != nil {

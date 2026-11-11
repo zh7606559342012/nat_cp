@@ -1,6 +1,6 @@
 // Package handler 是 CP 的业务处理层（对应 jxtx handler）：把 UPF 动态会话匹配到 OAM 静态配置，
-// 生成期望规则并驱动 UP 安装；同时实现说明书 5.10.2 的运行期 DNN
-// 配置新增事件驱动全量补偿与 6.7 的 RULE_SYNC 批量同步。
+// 生成期望规则并驱动 UP 安装；同时实现说明书 V1.1 3.4.2 的运行期 DNN
+// 配置新增事件驱动全量补偿与 3.5.8 的 RULE_SYNC 批量同步。
 //
 // 并发规则：
 //   - 同一 BusinessType+SrcIP 的规则操作必须串行化（分段锁），
@@ -150,6 +150,13 @@ func (e *Engine) buildRule(snap *conf.Snapshot, sess *webTypes.UeSession) (*webT
 // ApplySession 处理一条 UE 上线会话（POST create 或全量拉取）。
 // 幂等：内容相同的重复 create 不产生新版本、不重复下发。
 func (e *Engine) ApplySession(ctx context.Context, sess *webTypes.UeSession) error {
+	return e.applySession(ctx, sess, true)
+}
+
+// applySession 是 ApplySession 的实现。upsert=false 时只生成期望规则、
+// 不逐条向 UP 下发，供启动全量恢复收集用；规则随后由调用方以
+// RULE_SYNC SNAPSHOT 批量下发（说明书 V1.1 3.9.23）。
+func (e *Engine) applySession(ctx context.Context, sess *webTypes.UeSession, upsert bool) error {
 	sess.SrcIP = sess.NormalizeSrcIP()
 	if sess.SrcIP == "" {
 		e.log.WithFields(logrus.Fields{"imsi": sess.IMSI, "dnn": sess.DNN}).
@@ -212,6 +219,11 @@ func (e *Engine) ApplySession(ctx context.Context, sess *webTypes.UeSession) err
 		// Standby 只维护状态，不向 UP 写规则（说明书 11.2）。
 		return nil
 	}
+	if !upsert {
+		// 启动全量恢复的收集模式：只生成期望规则，不逐条下发；
+		// 规则由调用方随后以 RULE_SYNC SNAPSHOT 批量下发（说明书 V1.1 3.9.23）。
+		return nil
+	}
 	return e.upsertRule(ctx, rule)
 }
 
@@ -219,7 +231,6 @@ func (e *Engine) ApplySession(ctx context.Context, sess *webTypes.UeSession) err
 func (e *Engine) upsertRule(ctx context.Context, rule *webTypes.ForwardRule) error {
 	version := rule.DesiredVersion
 	var lastErr error
-	var lastCode int
 	for attempt := 0; attempt <= e.cfg.UP.MaxRetry; attempt++ {
 		var ack webTypes.RuleAckData
 		var code int
@@ -231,10 +242,10 @@ func (e *Engine) upsertRule(ctx context.Context, rule *webTypes.ForwardRule) err
 			ack, code, err = e.up.UpsertToB(ctx, reqID, rule.ToToBRule())
 		}
 		if err == nil {
-			e.markInstalled(rule, version, ack.AllocatedSrcNatIP)
+			e.markInstalled(rule, version, ack.AllocatedSrcNatIP, reqID)
 			return nil
 		}
-		lastErr, lastCode = err, code
+		lastErr = err
 		// 1001 参数非法：不重试；2001/2002：退避重试；其他 transport 错误同样重试。
 		if code == webTypes.UPCodeInvalidParam {
 			break
@@ -247,11 +258,14 @@ func (e *Engine) upsertRule(ctx context.Context, rule *webTypes.ForwardRule) err
 			}
 		}
 	}
-	e.markFailed(rule, version, lastCode, lastErr)
+	// 说明书 V1.1 3.9.19 注记：UP 返回失败或超时，直接删除规则。
+	// 先尽力向 UP 发 DELETE 清理可能半安装的规则，再删本地期望/安装状态；
+	// 会话保留在内存，后续 create/补偿/快照可重新生成规则。
+	e.deleteFailedRule(ctx, rule)
 	return lastErr
 }
 
-func (e *Engine) markInstalled(rule *webTypes.ForwardRule, version uint64, allocatedIP string) {
+func (e *Engine) markInstalled(rule *webTypes.ForwardRule, version uint64, allocatedIP string, requestID string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cur, ok := e.desired[rule.Key]
@@ -263,29 +277,31 @@ func (e *Engine) markInstalled(rule *webTypes.ForwardRule, version uint64, alloc
 	e.installed[rule.Key] = &webTypes.InstalledState{
 		Key: rule.Key, AllocatedSrcNatIP: allocatedIP, DesiredVersion: version,
 		Status: webTypes.InstalledStatusInstalled, LastCode: 0, LastMessage: "OK",
-		InstalledAt: now, UpdatedAt: now,
+		LastRequestID: requestID,
+		InstalledAt:   now, UpdatedAt: now,
 	}
 	e.log.WithFields(logrus.Fields{"rule": rule.Key.String(), "allocated": allocatedIP}).Info("rule installed")
 }
 
-func (e *Engine) markFailed(rule *webTypes.ForwardRule, version uint64, code int, err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	now := utils.NowMilli()
-	st, ok := e.installed[rule.Key]
-	if !ok {
-		st = &webTypes.InstalledState{Key: rule.Key}
-		e.installed[rule.Key] = st
+// deleteFailedRule 在规则安装最终失败后删除规则（说明书 V1.1 3.9.19 注记）。
+// 先尽力向 UP 发一次 DELETE（失败只记日志），再删除本地期望/安装状态。
+// 调用方已持有该规则键的锁；会话本身保留，后续事件可重新生成规则。
+func (e *Engine) deleteFailedRule(ctx context.Context, rule *webTypes.ForwardRule) {
+	reqID := utils.NewRequestID()
+	var err error
+	if rule.Key.BusinessType == webTypes.BusinessToH {
+		_, err = e.up.DeleteToH(ctx, reqID, rule.Key.SrcIP)
+	} else {
+		_, err = e.up.DeleteToB(ctx, reqID, rule.Key.SrcIP)
 	}
-	st.DesiredVersion = version
-	st.Status = webTypes.InstalledStatusFailed
-	st.LastCode = code
 	if err != nil {
-		st.LastMessage = err.Error()
+		e.log.WithError(err).WithField("rule", rule.Key.String()).Warn("delete failed rule on up failed")
 	}
-	st.RetryCount++
-	st.UpdatedAt = now
-	e.log.WithError(err).WithFields(logrus.Fields{"rule": rule.Key.String(), "code": code}).Error("rule install failed")
+	e.mu.Lock()
+	delete(e.desired, rule.Key)
+	delete(e.installed, rule.Key)
+	e.mu.Unlock()
+	e.log.WithField("rule", rule.Key.String()).Warn("rule deleted after up install failed")
 }
 
 // RemoveSession 处理 UE 下线：按 IMSI+DNN+srcIp 定位，删除 UP 规则与运行态。
@@ -475,7 +491,9 @@ func (e *Engine) EffectiveDNNs() []string {
 
 // FullSyncDNN 对单个 DNN 分页拉取全量会话并应用，返回处理条数。
 // 结束条件：某页返回数量 < step。
-func (e *Engine) FullSyncDNN(ctx context.Context, dnn string) (int, error) {
+// upsert=true 时逐条向 UP 下发规则（运行期补偿用）；upsert=false 时只收集
+// 期望规则，由调用方随后以 RULE_SYNC SNAPSHOT 批量下发（启动恢复用，说明书 V1.1 3.9.23）。
+func (e *Engine) FullSyncDNN(ctx context.Context, dnn string, upsert bool) (int, error) {
 	step := e.cfg.Sessions.PageStep
 	total := 0
 	for page := 1; ; page++ {
@@ -485,7 +503,7 @@ func (e *Engine) FullSyncDNN(ctx context.Context, dnn string) (int, error) {
 		}
 		for i := range pg.UeSessions {
 			s := pg.UeSessions[i]
-			if err := e.ApplySession(ctx, &s); err != nil {
+			if err := e.applySession(ctx, &s, upsert); err != nil {
 				e.log.WithError(err).WithField("session", s.SessionKey()).Warn("apply full-sync session failed")
 			}
 			total++
@@ -578,7 +596,7 @@ func (e *Engine) compensateOnce(ctx context.Context, dnn string) error {
 	if !e.snap.Load().ConfiguredDNNs()[dnn] {
 		return nil
 	}
-	_, err := e.FullSyncDNN(ctx, dnn)
+	_, err := e.FullSyncDNN(ctx, dnn, true)
 	return err
 }
 
@@ -647,8 +665,11 @@ func (e *Engine) onConfigChanged(ctx context.Context, ev webTypes.ConfigChangedE
 // ---------------------------------------------------------------------------
 
 // SnapshotSync 把当前全部期望规则按批次下发给 UP，用于 CP/UP 重启、
-// 主备切换后的规则恢复。失败规则只重试失败项；实时事件优先级高于
-// 快照：发送前与 ACK 落态时都以 Desired 版本为准，版本已变的跳过。
+// 主备切换后的规则恢复（说明书 V1.1 3.5.8 / 3.9.23）。
+// 一次发送全部批次：batchNo 从 1 顺序递增，最后一批 lastBatch=true；
+// 逐规则失败只重试失败项，走单条 UPSERT；整批调用失败（UP 不可达）的
+// 规则不单条重试，保留在期望集等下次快照再推。
+// 实时事件优先级高于快照：发送前与 ACK 落态时都以 Desired 版本为准，版本已变的跳过。
 func (e *Engine) SnapshotSync(ctx context.Context) error {
 	e.mu.Lock()
 	var items []snapItem
@@ -667,29 +688,52 @@ func (e *Engine) SnapshotSync(ctx context.Context) error {
 	if batchSize <= 0 {
 		batchSize = 500
 	}
-	// 失败重试轮次：只重试失败项。
-	pending := items
-	for round := 0; round <= e.cfg.UP.MaxRetry && len(pending) > 0; round++ {
-		var failed []snapItem
-		for start := 0; start < len(pending); start += batchSize {
-			end := start + batchSize
-			if end > len(pending) {
-				end = len(pending)
-			}
-			batch := pending[start:end]
-			lastBatch := end == len(pending) && round == e.cfg.UP.MaxRetry
-			batchFailed, err := e.sendSnapshotBatch(ctx, snapshotID, uint32(start/batchSize+1), lastBatch, batch)
-			if err != nil {
-				e.log.WithError(err).WithField("batch", start/batchSize+1).Error("snapshot batch failed")
-				failed = append(failed, batch...)
+	var ruleFailed, batchFailed []snapItem
+	for start := 0; start < len(items); start += batchSize {
+		end := start + batchSize
+		if end > len(items) {
+			end = len(items)
+		}
+		batch := items[start:end]
+		lastBatch := end == len(items)
+		failed, err := e.sendSnapshotBatch(ctx, snapshotID, uint32(start/batchSize+1), lastBatch, batch)
+		if err != nil {
+			e.log.WithError(err).WithField("batch", start/batchSize+1).Error("snapshot batch failed")
+			batchFailed = append(batchFailed, batch...)
+			continue
+		}
+		ruleFailed = append(ruleFailed, failed...)
+	}
+	// 逐规则失败只重试失败项（说明书 V1.1 3.5.8.2），走单条 UPSERT；
+	// 重试耗尽后 upsertRule 按 3.9.19 删除规则，不再计入待处理。
+	failed := ruleFailed
+	for round := 0; round < e.cfg.UP.MaxRetry && len(failed) > 0; round++ {
+		var still []snapItem
+		for _, it := range failed {
+			lk := e.keyLock(it.rule.Key)
+			lk.Lock()
+			e.mu.Lock()
+			cur, ok := e.desired[it.rule.Key]
+			e.mu.Unlock()
+			if !ok || cur.DesiredVersion != it.version {
+				lk.Unlock()
 				continue
 			}
-			failed = append(failed, batchFailed...)
+			err := e.upsertRule(ctx, it.rule)
+			lk.Unlock()
+			if err != nil {
+				e.mu.Lock()
+				_, stillDesired := e.desired[it.rule.Key]
+				e.mu.Unlock()
+				if stillDesired {
+					still = append(still, it)
+				}
+			}
 		}
-		pending = failed
+		failed = still
 	}
-	if len(pending) > 0 {
-		return fmt.Errorf("snapshot sync: %d rules still failed", len(pending))
+	if len(batchFailed) > 0 || len(failed) > 0 {
+		return fmt.Errorf("snapshot sync: %d batch-failed and %d rule-failed rules", len(batchFailed), len(failed))
 	}
 	return nil
 }
@@ -721,7 +765,8 @@ func (e *Engine) sendSnapshotBatch(ctx context.Context, snapshotID string, batch
 	if len(rules) == 0 {
 		return nil, nil
 	}
-	ack, err := e.up.Snapshot(ctx, utils.NewRequestID(), snapshotID, batchNo, lastBatch, rules)
+	reqID := utils.NewRequestID()
+	ack, err := e.up.Snapshot(ctx, reqID, snapshotID, batchNo, lastBatch, rules)
 	if err != nil {
 		return nil, err
 	}
@@ -747,20 +792,12 @@ func (e *Engine) sendSnapshotBatch(ctx context.Context, snapshotID string, batch
 			e.installed[it.rule.Key] = &webTypes.InstalledState{
 				Key: it.rule.Key, AllocatedSrcNatIP: res.AllocatedSrcNatIP,
 				DesiredVersion: it.version, Status: webTypes.InstalledStatusInstalled,
-				LastCode: 0, LastMessage: "OK", InstalledAt: now, UpdatedAt: now,
+				LastCode: 0, LastMessage: "OK", LastRequestID: reqID,
+				InstalledAt: now, UpdatedAt: now,
 			}
 		} else {
-			st, ok := e.installed[it.rule.Key]
-			if !ok {
-				st = &webTypes.InstalledState{Key: it.rule.Key}
-				e.installed[it.rule.Key] = st
-			}
-			st.DesiredVersion = it.version
-			st.Status = webTypes.InstalledStatusFailed
-			st.LastCode = res.Code
-			st.LastMessage = res.Message
-			st.RetryCount++
-			st.UpdatedAt = now
+			// 失败项不落 FAILED 状态，交给 SnapshotSync 的单条重试；
+			// 重试耗尽后由 upsertRule 按说明书 V1.1 3.9.19 删除规则。
 			failed = append(failed, it)
 		}
 	}

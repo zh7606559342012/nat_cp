@@ -273,7 +273,14 @@ type ConfigChangedEvent struct {
 
 // DNNConfigChangedOp：触发定向全量补偿的操作。
 // 只有 ADD/BATCH_ADD，或使某 DNN 从"无本机绑定"变为"存在本机绑定"的
-// MODIFY，才触发首次定向全量补偿；DELETE 不触发 UPF 全量查询。
+// MODIFY（即 NewDNNs 非空），才触发首次定向全量补偿；DELETE 不触发 UPF 全量查询。
 func (e ConfigChangedEvent) TriggersFullCompensation() bool {
-	return e.Op == "ADD" || e.Op == "BATCH" || e.Op == "BATCH_ADD" || e.Op == "MODIFY"
+	switch e.Op {
+	case "ADD", "BATCH", "BATCH_ADD":
+		return true
+	case "MODIFY":
+		return len(e.NewDNNs) > 0
+	default:
+		return false
+	}
 }

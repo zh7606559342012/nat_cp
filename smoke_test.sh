@@ -44,3 +44,13 @@ curl -s -X POST http://127.0.0.1:18080/debug/snapshot-sync; echo
 sleep 1
 echo "-- UP rules after snapshot-sync (expect 20.20.2.1 TOB):"
 uprules
+
+echo "== 5. 重启 CP：启动应以 RULE_SYNC SNAPSHOT 恢复规则 =="
+kill $CP_PID; sleep 1
+/tmp/cp -config main/conf/cp-test.yaml > /tmp/cp.log 2>&1 &
+CP_PID=$!
+sleep 4
+echo "-- state after restart (expect active:true, desired=2, installed=2):"
+curl -s http://127.0.0.1:18080/debug/state; echo
+echo "-- UP rules after restart (expect 20.20.1.1 TOH + 20.20.2.1 TOB):"
+uprules

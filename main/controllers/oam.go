@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/sirupsen/logrus"
@@ -27,6 +29,8 @@ type OAMServer struct {
 	snap   *conf.Holder
 	engine *handler.Engine
 	log    *logrus.Entry
+
+	reloadRunning atomic.Bool // 后台快照 reload 是否在跑，保证同时只有一个
 }
 
 // NewOAMServer 创建 OAM 服务。
@@ -62,7 +66,16 @@ func (s *OAMServer) HandleCall(c *gin.Context) {
 	version := s.repo.NextVersion()
 	newSnap, err := s.buildSnapshot(version)
 	if err != nil {
+		// 瞬时错误（如短暂锁冲突）重试两次再放弃。
+		for i := 0; i < 2 && err != nil; i++ {
+			time.Sleep(100 * time.Millisecond)
+			newSnap, err = s.buildSnapshot(version)
+		}
+	}
+	if err != nil {
 		s.log.WithError(err).Error("rebuild snapshot failed after commit")
+		// 说明书 V1.1 3.9.13：提交成功但快照重建失败，应告警并触发全量 reload。
+		s.startReloadLoop()
 		s.respond(c, req.UUID, 500, "snapshot rebuild failed: "+err.Error(), nil)
 		return
 	}
@@ -73,7 +86,11 @@ func (s *OAMServer) HandleCall(c *gin.Context) {
 		select {
 		case s.engine.Events() <- *ev:
 		default:
-			s.log.Warn("config event channel full, event dropped")
+			// 通道满时不再丢弃事件：起 goroutine 等位投递，保证配置提交后
+			// 事件必达（说明书 V1.1 3.4.2）；Go 按 FIFO 唤醒阻塞的发送方，顺序不受影响。
+			s.log.Warn("config event channel full, delivering asynchronously")
+			evCopy := *ev
+			go func() { s.engine.Events() <- evCopy }()
 		}
 	}
 	s.respond(c, req.UUID, 0, "OK", data)
@@ -98,6 +115,40 @@ func (s *OAMServer) buildSnapshot(version uint64) (*conf.Snapshot, error) {
 		return nil, err
 	}
 	return conf.Build(version, vxlan, vb, fttrb, fb), nil
+}
+
+// startReloadLoop 在快照重建失败后后台重试全量 reload（说明书 V1.1 3.9.13）：
+// 每 5 秒从 SQLite 全量重读并重建快照，成功后原子替换并发布一次 ADD 事件，
+// 让各 DNN 重新跑定向全量补偿。同一时间最多一个 reload 循环在跑。
+func (s *OAMServer) startReloadLoop() {
+	if !s.reloadRunning.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer s.reloadRunning.Store(false)
+		for {
+			time.Sleep(5 * time.Second)
+			version := s.repo.NextVersion()
+			snap, err := s.buildSnapshot(version)
+			if err != nil {
+				s.log.WithError(err).Error("snapshot reload retry failed")
+				continue
+			}
+			s.snap.Store(snap)
+			ev := &webTypes.ConfigChangedEvent{Op: "ADD", Version: version}
+			for d := range snap.ConfiguredDNNs() {
+				ev.DNNs = append(ev.DNNs, d)
+			}
+			select {
+			case s.engine.Events() <- *ev:
+			default:
+				evCopy := *ev
+				go func() { s.engine.Events() <- evCopy }()
+			}
+			s.log.Info("snapshot reloaded after failure")
+			return
+		}
+	}()
 }
 
 // newlyAppearedDNNs 返回新快照中有、旧快照中没有的 DNN，

@@ -6,7 +6,8 @@
 //  4 获取 Token → 5 Ping UPF → 6 获取 DNN List → 7 计算 EffectiveDNN →
 //  8 按 DNN 拉取一次全量 Session → 9 匹配并生成规则 → 10 向 UP 下发规则 →
 //  11 注册 UE 上下线订阅 → 12 进入 RUNNING。
-// 其中 8~10 由 handler.FullSyncDNN（分页拉取 + 逐条匹配 + ADD/UPSERT 下发）完成。
+// 其中 8~10 由 handler.FullSyncDNN（分页拉取 + 逐条匹配，只收集期望规则）
+// 与 handler.SnapshotSync（RULE_SYNC SNAPSHOT 批量下发，见说明书 V1.1 3.9.23）完成。
 //
 // Standby（active=false）只加载配置、提供 OAM 与回调服务，
 // 不向 UPF 注册订阅、不向 UP 写规则（说明书 11.2）。
@@ -89,11 +90,19 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 	effective := eng.EffectiveDNNs()
 	log.WithField("effectiveDNNs", effective).Info("effective dnn set")
 
-	// 8~10. 按 DNN 拉取一次全量 Session 并下发 UP 规则。
+	// 8~10. 按 DNN 拉取一次全量 Session，只收集期望规则（不逐条下发）。
 	for _, dnn := range effective {
-		if _, err := eng.FullSyncDNN(ctx, dnn); err != nil {
+		if _, err := eng.FullSyncDNN(ctx, dnn, false); err != nil {
 			log.WithError(err).WithField("dnn", dnn).Error("initial full sync failed, continue with other dnns")
 		}
+	}
+
+	// 10b. 把全量恢复得到的全部期望规则以 RULE_SYNC SNAPSHOT 批量下发 UP
+	//     （说明书 V1.1 3.9.23），处理批次 ACK 后再注册订阅。
+	//     快照失败只告警，不阻塞进入 RUNNING；失败规则已在快照内单条重试，
+	//     仍失败的按 3.9.19 删除，可由后续事件或手动快照重新生成。
+	if err := eng.SnapshotSync(ctx); err != nil {
+		log.WithError(err).Warn("initial snapshot sync failed")
 	}
 
 	// 11. 注册 UE 上下线订阅；失败则由 monitor 在后续心跳中补注册。

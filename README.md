@@ -77,12 +77,13 @@ webTypes / utils
               ← main（入口）
 ```
 
-## 核心流程（说明书 5.10）
+## 核心流程（说明书 V1.1 第 3 章）
 
 1. **启动**：加载 SQLite 静态配置 → 构建内存索引 → 启动回调与 OAM 服务 →
    Token → Ping → DNN List → EffectiveDNN（Configured ∩ Upf）→
-   按 DNN 分页拉全量 Session → 匹配生成规则 → ADD/UPSERT 下发 UP →
-   注册订阅 → RUNNING。
+   按 DNN 分页拉全量 Session → 匹配生成期望规则 →
+   RULE_SYNC SNAPSHOT 批量下发 UP → 注册订阅 → RUNNING。
+   启动全量只收集期望规则，不逐条下发（见 3.9.23）。
 2. **增量**：UPF POST create/delete 到回调地址，CP 按 IMSI+DNN 匹配，
    生成/删除 ToH/ToB 规则；UP 在 ACK 中返回从 SNAT 地址段内分配的
    具体 IP（`allocatedSrcNatIp`），CP 记入安装状态。
@@ -94,8 +95,10 @@ webTypes / utils
    crontab 定时重试。删除配置不触发 UPF 全量查询，直接重算受影响
    会话删规则。
 4. **批量恢复**：CP/UP 重启或主备切换后，用 RULE_SYNC SNAPSHOT
-   按批次（默认 500 条）重放期望规则；失败只重试失败项；
+   按批次（默认 500 条）重放期望规则；逐规则失败走单条 UPSERT
+   只重试失败项，整批调用失败的规则保留在期望集等下次快照；
    实时事件优先级高于快照（按 Desired 版本校验，旧 ACK 不覆盖）。
+   UP 返回失败或超时且重试耗尽时直接删除规则（见 3.9.19 注记）。
 
 ## 启动使用
 

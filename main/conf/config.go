@@ -123,6 +123,13 @@ func (c *Config) applyDefaults() {
 	if c.UP.SnapshotBatchSize <= 0 {
 		c.UP.SnapshotBatchSize = 500
 	}
+	// 说明书 V1.1 3.5.8：单批默认 500，允许配置 100~1000；越界时夹到边界。
+	if c.UP.SnapshotBatchSize < 100 {
+		c.UP.SnapshotBatchSize = 100
+	}
+	if c.UP.SnapshotBatchSize > 1000 {
+		c.UP.SnapshotBatchSize = 1000
+	}
 	if c.UP.TimeoutSec <= 0 {
 		c.UP.TimeoutSec = 10
 	}
