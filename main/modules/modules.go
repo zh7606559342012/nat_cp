@@ -111,6 +111,7 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 		log.WithError(err).Warn("initial subscribe failed, monitor will retry")
 	} else {
 		subscribed = true
+		log.WithField("callbackURL", cfg.UPF.CallbackURL).Info("upf subscribe ok")
 	}
 
 	// 12. 进入 RUNNING：链路监控与定时任务接管后续维护。

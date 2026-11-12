@@ -52,6 +52,9 @@ type Engine struct {
 
 	linkDown atomic.Bool
 
+	skipLogMu   sync.Mutex
+	skipLogLast map[string]time.Time // sessionKey -> 上次记“无绑定跳过”日志的时间
+
 	events chan webTypes.ConfigChangedEvent
 	log    *logrus.Entry
 }
@@ -82,6 +85,7 @@ func New(cfg *conf.Config, snap *conf.Holder, upfCli *upf.Client, upCli *up.Clie
 		installed:    make(map[webTypes.RuleKey]*webTypes.InstalledState),
 		comp:         make(map[string]*compState),
 		upfDNN:       make(map[string]bool),
+		skipLogLast:  make(map[string]time.Time),
 		events:       make(chan webTypes.ConfigChangedEvent, 128),
 		log:          logrus.WithField("module", "engine"),
 	}
@@ -186,8 +190,7 @@ func (e *Engine) applySession(ctx context.Context, sess *webTypes.UeSession, ups
 			delete(e.sessionRules, sess.SessionKey())
 			e.mu.Unlock()
 		}
-		e.log.WithFields(logrus.Fields{"imsi": sess.IMSI, "dnn": sess.DNN, "srcIp": sess.SrcIP}).
-			Debug("session has no business binding, skip")
+		e.logSkipNoBinding(sess)
 		return nil
 	}
 
@@ -225,6 +228,23 @@ func (e *Engine) applySession(ctx context.Context, sess *webTypes.UeSession, ups
 		return nil
 	}
 	return e.upsertRule(ctx, rule)
+}
+
+// logSkipNoBinding 记一条“会话无业务绑定、跳过生成规则”的日志。
+// 测试用例 022/023/030/036 要在默认 info 级日志里看到“未生成 SNAT 表”，
+// 所以这里用 Info 而不用 Debug；同一会话 60 秒内只记一次，
+// 无效 DNN 的 UE 事件再多也不会刷屏。
+func (e *Engine) logSkipNoBinding(sess *webTypes.UeSession) {
+	key := sess.SessionKey()
+	e.skipLogMu.Lock()
+	if last, ok := e.skipLogLast[key]; ok && time.Since(last) < time.Minute {
+		e.skipLogMu.Unlock()
+		return
+	}
+	e.skipLogLast[key] = time.Now()
+	e.skipLogMu.Unlock()
+	e.log.WithFields(logrus.Fields{"imsi": sess.IMSI, "dnn": sess.DNN, "srcIp": sess.SrcIP}).
+		Info("session has no business binding, skip")
 }
 
 // upsertRule 向 UP 下发一条规则并落安装状态。调用方已持有该规则键的锁。

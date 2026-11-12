@@ -24,6 +24,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"natcp/main/webTypes"
 )
 
@@ -81,6 +83,8 @@ type Client struct {
 	mu     sync.Mutex
 	token  string
 	expiry time.Time
+
+	log *logrus.Entry
 }
 
 // New 创建 UPF 客户端。
@@ -92,6 +96,7 @@ func New(baseURL, user, pwdMD5 string, timeout time.Duration, ttlMin, refreshBef
 		ttl:       time.Duration(ttlMin) * time.Minute,
 		refreshBefore: time.Duration(refreshBeforeSec) * time.Second,
 		http:      &http.Client{Timeout: timeout},
+		log:           logrus.WithField("module", "upf"),
 	}
 }
 
@@ -130,6 +135,8 @@ func (c *Client) GetToken(ctx context.Context) (string, error) {
 	c.token = token
 	c.expiry = time.Now().Add(c.ttl)
 	c.mu.Unlock()
+	// 只记“拿到 token”这一事实，不记 token 本身的值。
+	c.log.Info("upf token obtained")
 	return token, nil
 }
 

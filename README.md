@@ -135,6 +135,20 @@ logrotate：每天、保留 10 份、单份 20M、copytruncate，与 jxtx 的 ag
 文件打不开时的输出。从旧版本（`/opt/nat_cp` + `natcp.service`）升级会自动
 停用旧服务并沿用旧配置。
 
+测试用例（智云随行 FAGW 测试用例.xlsx，CP-用例）观察点与日志行的对应关系
+（默认 `logLevel: info`，都在 `/var/log/fagw-cp/cp.log` 里）：
+- token 拿到：`upf token obtained`（只记事实，不记 token 值）；拿不到：
+  `get upf token failed, retry in 5s`（error 文本里带 `http 401`）。
+- 订阅成功：`upf subscribe ok`；心跳成功（每 `pingIntervalSec` 一行）：
+  `upf ping ok`；链路恢复：`upf link recovered`。
+- 规则下发成功：`rule installed`；删除：`rule deleted`；UP 下发失败：
+  `rule deleted after up install failed`（按 V1.1 3.9.19 注记删规则）。
+- 会话无业务绑定（无效 DNN、配置颠倒、删了绑定）：
+  `session has no business binding, skip`，同一会话 60 秒内只记一次，
+  不会刷屏；绑定在但 VXLAN/FTTRB 配置缺失：`build rule failed`。
+- 注意：UPF 返回的 200/401 这类原始返回码只在抓包或 UPF 侧可见；
+  CP 日志里失败时 error 文本会带 `http <状态码>`。
+
 ### 方式三：Windows 本地开发
 
 本地与生产用**同一个驱动**（`mattn/go-sqlite3`，CGO），不存在“本地通过、上线行为不同”的问题。

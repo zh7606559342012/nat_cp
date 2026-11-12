@@ -86,6 +86,8 @@ func (m *Monitor) tick(ctx context.Context) {
 		m.engine.SetLinkDown(true)
 		return
 	}
+	// 心跳成功也记一行，供测试用例 013 在日志里核对 200。
+	m.log.Info("upf ping ok")
 	wasDown := m.engine.IsLinkDown()
 	m.engine.SetLinkDown(false)
 	if wasDown {
