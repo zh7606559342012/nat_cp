@@ -10,6 +10,8 @@ package models
 //     DB 的 id 列是 TEXT，但 database/sql 内置支持数字字段与文本列的互转
 //     （写入时按整数下发、读取时用 strconv.ParseUint 解析），
 //     所以不需要自定义类型，也不需要改表结构。
+//     旧库里非数字的字符串 id（如 vx1）在启动时由 httpServer.migrate
+//     自动重编号，见 migrateNumericIDs；数字串本身可直接读。
 //   - 绑定的 IMSI / fttrbId 用 string：CP 内部全部当标识串处理（拼接、比较、查表）；
 //     OAM 传数字时在 controllers 层转成字符串。
 //   - VNI 相关用 uint32：VNI 是 24 位，uint32 足够且与 DB 的 INTEGER 对齐。

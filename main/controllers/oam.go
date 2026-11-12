@@ -54,7 +54,7 @@ type oamRequest struct {
 // 与外层同值。区别只在 body 的形状：
 //
 //	成功（查询） {"uuid":"q1","ret":0,
-//	             "body":{"ret":0,"total":3,"records":[{"id":"vx1",...}]}}
+//	             "body":{"ret":0,"total":3,"records":[{"id":1,...}]}}
 //	成功（写入） {"uuid":"a1","ret":0,"body":{"ret":0,"msg":"新增成功"}}
 //	失败（任意） {"uuid":"a2","ret":-9,
 //	             "body":{"ret":-9,"msg":"vxlan v1 already exists, ..."}}

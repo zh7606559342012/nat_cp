@@ -442,7 +442,7 @@ func (s *Repository) UpsertVxlanBinding(b VxlanImsiBinding) error {
 	now := utils.NowMilli()
 	_, err = tx.Exec(`INSERT INTO vxlan_imsi_binding(id,imsi,dnn,vni,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
-		ON CONFLICT(imsi,dnn) DO UPDATE SET vni=excluded.vni, updated_at=excluded.updated_at`,
+		ON CONFLICT(imsi,dnn) DO UPDATE SET id=excluded.id, vni=excluded.vni, updated_at=excluded.updated_at`,
 		b.ID, b.IMSI, b.DNN, b.VNI, now, now)
 	if err != nil {
 		return err
@@ -593,7 +593,7 @@ func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
 	now := utils.NowMilli()
 	_, err = tx.Exec(`INSERT INTO fttrb_imsi_binding(id,imsi,dnn,fttrb_id,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
-		ON CONFLICT(imsi,dnn) DO UPDATE SET fttrb_id=excluded.fttrb_id, updated_at=excluded.updated_at`,
+		ON CONFLICT(imsi,dnn) DO UPDATE SET id=excluded.id, fttrb_id=excluded.fttrb_id, updated_at=excluded.updated_at`,
 		b.ID, b.IMSI, b.DNN, b.FttrbID, now, now)
 	if err != nil {
 		return err

@@ -389,6 +389,15 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
 注意 `/ue/callback`（UPF 回调）与 `/debug/*` 仍是各自的 `{code, message}` 格式，
 不走这套信封。
 
+### 旧库升级：字符串 ID 自动迁移
+
+acb91f99 之前主键 id 是字符串（如 vx1/b1）。新版启动时 `migrate()` 会自动
+把四张表里解析不成数字（或为 0）的 id 重编号（取该表最大数字 id +1 起），
+其余字段不动；数字串（如 '999101'）本身就能读，不用迁。迁移过程记在日志里
+（`migrated non-numeric config id to uint32`）。绑定表的外键只认 fttrb_id /
+VNI，不认数字 id，所以改 id 不影响关联。OAM 侧若还存着旧字符串 id，迁移后
+需按 `list_*` 返回的新数字 id 重新对齐。
+
 ## CP-UP socket 约定（待联调冻结，见说明书第 12 章 Q1）
 
 - 传输：Unix Domain Socket，默认 `unix:///var/run/fusion-access-gw/up.sock`。

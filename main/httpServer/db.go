@@ -7,9 +7,11 @@ package httpServer
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/sirupsen/logrus"
 )
 
 // DB 是 CP 全局 SQLite 连接，由 DbConnInit 建立。
@@ -94,5 +96,73 @@ func migrate(db *sql.DB) error {
 	if _, err := db.Exec(ddl); err != nil {
 		return fmt.Errorf("migrate sqlite: %w", err)
 	}
+	// acb91f99 起主键 id 改为 uint32：旧库里的字符串 id（如 vx1/b1）读表
+	// 时会报 Scan 错误、导致启动建快照失败，这里先把它们重编号。
+	if err := migrateNumericIDs(db); err != nil {
+		return err
+	}
 	return nil
+}
+
+// migrateNumericIDs 把四张静态表里旧的字符串主键重编号为数字主键。
+//
+// 数字串（如 '999101'）本身能被 ParseUint，不动；只有解析失败或为 0 的
+// 行才重新编号（取该表已有最大数字 id +1 起），其余字段不动。绑定表的
+// 外键只认 fttrb_id / VNI，不认数字 id，所以改 id 不影响关联。
+// OAM 侧若还存着旧字符串 id，迁移后需按 list_* 返回的新数字 id 对齐。
+func migrateNumericIDs(db *sql.DB) error {
+	for _, table := range []string{
+		"vxlan_config", "vxlan_imsi_binding", "fttrb_config", "fttrb_imsi_binding",
+	} {
+		if err := migrateTableIDs(db, table); err != nil {
+			return fmt.Errorf("migrate %s ids: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func migrateTableIDs(db *sql.DB, table string) error {
+	rows, err := db.Query(fmt.Sprintf("SELECT id FROM %s", table))
+	if err != nil {
+		return err
+	}
+	var bad []string
+	var max uint64
+	for rows.Next() {
+		var idStr string
+		if err := rows.Scan(&idStr); err != nil {
+			rows.Close()
+			return err
+		}
+		n, err := strconv.ParseUint(idStr, 10, 32)
+		if err != nil || n == 0 {
+			bad = append(bad, idStr)
+			continue
+		}
+		if uint64(n) > max {
+			max = uint64(n)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) == 0 {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	next := max + 1
+	for _, old := range bad {
+		if _, err := tx.Exec(fmt.Sprintf("UPDATE %s SET id = ? WHERE id = ?", table), next, old); err != nil {
+			return err
+		}
+		logrus.WithField("table", table).WithField("old_id", old).
+			WithField("new_id", next).Warn("migrated non-numeric config id to uint32")
+		next++
+	}
+	return tx.Commit()
 }
