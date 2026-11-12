@@ -144,6 +144,8 @@ logrotate：每天、保留 10 份、单份 20M、copytruncate，与 jxtx 的 ag
   `upf ping ok`；链路恢复：`upf link recovered`。
 - 收到 UPF 推送并回复 200：`callback ok`（带 action/imsi/dnn）；
   启动快照完成：`initial snapshot sync done`（`desiredRules=0` 表示未生成 SNAT 表）。
+- 启动从库加载配置（建联之前）：`initial snapshot loaded from db`
+  （configuredDNNs/vxlanRanges/fttrbConfigs/bindings）。
 - 规则下发成功：`rule installed`；删除：`rule deleted`；UP 下发失败：
   `rule deleted after up install failed`（按 V1.1 3.9.19 注记删规则）。
 - 会话无业务绑定（无效 DNN、配置颠倒、删了绑定）：

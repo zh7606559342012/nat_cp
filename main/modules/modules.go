@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
+	"sort"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -45,6 +46,21 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 		return fmt.Errorf("build initial snapshot: %w", err)
 	}
 	holder := conf.NewHolder(snap0)
+
+	// 启动即记从库加载的配置：建联之前就能在日志里看到库里有什么 DNN，
+	// 否则 effective 为空时分不清是“库里没配”还是“UPF 列表没交集”。
+	configured := snap0.ConfiguredDNNs()
+	dnns := make([]string, 0, len(configured))
+	for d := range configured {
+		dnns = append(dnns, d)
+	}
+	sort.Strings(dnns)
+	log.WithFields(logrus.Fields{
+		"configuredDNNs": dnns,
+		"vxlanRanges":    len(snap0.VxlanRanges),
+		"fttrbConfigs":   len(snap0.Fttrb),
+		"bindings":       len(snap0.Bindings),
+	}).Info("initial snapshot loaded from db")
 
 	upfCli, err := upf.New(cfg.UPF.BaseURL, cfg.UPF.User, cfg.UPF.PwdMD5,
 		time.Duration(cfg.UPF.TimeoutSec)*time.Second, cfg.UPF.TokenTTLMin, cfg.UPF.TokenRefreshBeforeSec,
