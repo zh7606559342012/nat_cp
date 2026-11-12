@@ -104,6 +104,9 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 	if err := eng.SnapshotSync(ctx); err != nil {
 		log.WithError(err).Warn("initial snapshot sync failed")
 	}
+	// 启动快照完成即记期望规则数：无配置时为 0，供测试用例 021 在日志里
+	// 核对“未生成 SNAT 表”（desiredRules=0）；有配置时即为恢复的规则数。
+	log.WithField("desiredRules", eng.Stats().Desired).Info("initial snapshot sync done")
 
 	// 11. 注册 UE 上下线订阅；失败则由 monitor 在后续心跳中补注册。
 	subscribed := false

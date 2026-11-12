@@ -46,6 +46,8 @@ func CallbackHandler(e *handler.Engine) gin.HandlerFunc {
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "unknown action"})
 			return
 		}
+		// 回 200 前记一行，供测试用例 015 在日志里核对“收到推送并回复 200”。
+		log.WithFields(logrus.Fields{"action": sess.Action, "imsi": sess.IMSI, "dnn": sess.DNN}).Info("callback ok")
 		c.JSON(http.StatusOK, gin.H{"code": 0, "message": "OK"})
 	}
 }
