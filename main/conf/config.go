@@ -32,6 +32,15 @@ type Config struct {
 		// PingIntervalSec 为 RUNNING 阶段心跳间隔；心跳失败不等价 UE 全部下线。
 		PingIntervalSec int `yaml:"pingIntervalSec"`
 		TimeoutSec      int `yaml:"timeoutSec"`
+		// TLS 是 UPF HTTPS 客户端配置（仿 jxtx https 客户端：Transport +
+		// TLSClientConfig）。baseURL 用 http 时忽略；用 https 时生效。
+		// 一键切换：调试把 baseURL 改成 http://...，联调改回 https://...。
+		TLS struct {
+			// InsecureSkipVerify 跳过服务端证书校验（自签证书联调用；生产不要开）。
+			InsecureSkipVerify bool `yaml:"insecureSkipVerify"`
+			// CAFile 为 UPF 的 CA 证书（PEM 格式）；为空则用系统根证书。
+			CAFile string `yaml:"caFile"`
+		} `yaml:"tls"`
 	} `yaml:"upf"`
 
 	Callback struct {

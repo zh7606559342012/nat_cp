@@ -46,8 +46,12 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 	}
 	holder := conf.NewHolder(snap0)
 
-	upfCli := upf.New(cfg.UPF.BaseURL, cfg.UPF.User, cfg.UPF.PwdMD5,
-		time.Duration(cfg.UPF.TimeoutSec)*time.Second, cfg.UPF.TokenTTLMin, cfg.UPF.TokenRefreshBeforeSec)
+	upfCli, err := upf.New(cfg.UPF.BaseURL, cfg.UPF.User, cfg.UPF.PwdMD5,
+		time.Duration(cfg.UPF.TimeoutSec)*time.Second, cfg.UPF.TokenTTLMin, cfg.UPF.TokenRefreshBeforeSec,
+		upf.TLSConfig{InsecureSkipVerify: cfg.UPF.TLS.InsecureSkipVerify, CAFile: cfg.UPF.TLS.CAFile})
+	if err != nil {
+		return fmt.Errorf("build upf client: %w", err)
+	}
 	upCli := up.New(cfg.UP.Socket, time.Duration(cfg.UP.TimeoutSec)*time.Second, cfg.UP.MaxRetry)
 	eng := handler.New(cfg, holder, upfCli, upCli)
 

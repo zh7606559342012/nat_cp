@@ -8,9 +8,16 @@ logPath: /var/log/fagw-cp/cp.log
 
 upf:
   # UPF 北向地址（含协议与端口，生产为 https://<UPF-IP>:8153）
+  # 一键切换 http/https：调试把下面改成 http://...，联调改回 https://...。
   baseURL: https://10.216.4.160:8153
   user: ehgw
   pwdMD5: "00000000000000000000000000000000" # 替换为真实 MD5
+  # tls：HTTPS 客户端配置（仿 jxtx https 客户端）。baseURL 用 http 时忽略。
+  # insecureSkipVerify=true 跳过证书校验（自签证书联调用；生产不要开）。
+  # caFile 为 UPF 的 CA 证书（PEM）；为空用系统根证书；打不开则启动报错。
+  tls:
+    insecureSkipVerify: false
+    caFile: ""
   # CP 提供给 UPF 的回调地址：UPF 用 POST 向该地址推送 UE create/delete。
   # 必须是 UPF 能访问到的地址（含 CP 监听端口与回调路径）。
   callbackURL: http://172.16.123.221:18080/ue/callback

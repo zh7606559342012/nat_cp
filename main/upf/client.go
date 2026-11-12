@@ -15,11 +15,14 @@ package upf
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -87,17 +90,56 @@ type Client struct {
 	log *logrus.Entry
 }
 
-// New 创建 UPF 客户端。
-func New(baseURL, user, pwdMD5 string, timeout time.Duration, ttlMin, refreshBeforeSec int) *Client {
-	return &Client{
-		baseURL:   strings.TrimRight(baseURL, "/"),
-		user:      user,
-		pwdMD5:    pwdMD5,
-		ttl:       time.Duration(ttlMin) * time.Minute,
+// TLSConfig 是 UPF HTTPS 客户端的 TLS 配置（仿 jxtx https 客户端：
+// Transport + TLSClientConfig{InsecureSkipVerify}，但做成配置项，
+// 不动 http.DefaultClient）。baseURL 用 http 时忽略。
+type TLSConfig struct {
+	InsecureSkipVerify bool
+	CAFile             string
+}
+
+// New 创建 UPF 客户端。baseURL 自带协议：http 调试、https 联调，改一行即切换。
+// baseURL 用 https 时按 tlsCfg 配 TLS；CA 文件打不开直接返回错误，不静默回退。
+func New(baseURL, user, pwdMD5 string, timeout time.Duration, ttlMin, refreshBeforeSec int, tlsCfg TLSConfig) (*Client, error) {
+	c := &Client{
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		user:          user,
+		pwdMD5:        pwdMD5,
+		ttl:           time.Duration(ttlMin) * time.Minute,
 		refreshBefore: time.Duration(refreshBeforeSec) * time.Second,
-		http:      &http.Client{Timeout: timeout},
+		http:          &http.Client{Timeout: timeout},
 		log:           logrus.WithField("module", "upf"),
 	}
+	if strings.HasPrefix(strings.ToLower(c.baseURL), "https://") {
+		tlsConf, err := buildTLSConfig(tlsCfg)
+		if err != nil {
+			return nil, err
+		}
+		tr := http.DefaultTransport.(*http.Transport).Clone()
+		tr.TLSClientConfig = tlsConf
+		c.http = &http.Client{Timeout: timeout, Transport: tr}
+		c.log.WithFields(logrus.Fields{"insecureSkipVerify": tlsCfg.InsecureSkipVerify, "caFile": tlsCfg.CAFile}).
+			Info("upf https client configured")
+	}
+	return c, nil
+}
+
+// buildTLSConfig 按配置构造 TLS 配置；CA 文件读不到或里面没有证书就报错。
+func buildTLSConfig(cfg TLSConfig) (*tls.Config, error) {
+	tlsConf := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
+	if cfg.CAFile == "" {
+		return tlsConf, nil
+	}
+	pem, err := os.ReadFile(cfg.CAFile)
+	if err != nil {
+		return nil, fmt.Errorf("upf tls caFile: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("upf tls caFile %s: no certificates found", cfg.CAFile)
+	}
+	tlsConf.RootCAs = pool
+	return tlsConf, nil
 }
 
 // GetToken 调用 token 接口。响应体可能是带引号的 JSON 字符串或裸字符串，

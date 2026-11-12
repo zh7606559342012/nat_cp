@@ -8,6 +8,11 @@ upf:
   baseURL: http://127.0.0.1:18153
   user: ehgw
   pwdMD5: "04f5349605824dec612bd1493efdc923"
+  # tls：baseURL 用 http 时忽略；联调改成 https 时，insecureSkipVerify=true
+  # 可跳过自签证书校验（仅联调）。
+  tls:
+    insecureSkipVerify: false
+    caFile: ""
   callbackURL: http://127.0.0.1:18080/ue/callback
   tokenTTLMin: 30
   tokenRefreshBeforeSec: 300

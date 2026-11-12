@@ -35,6 +35,7 @@ install.sh                 # 一键安装脚本
 upgrade.sh                 # 平滑升级脚本
 initial_compile.sh         # Go 工具链初始化脚本
 smoke_test.sh              # 本地联调冒烟脚本
+pcap-flow.py               # 把抓包还原成 CP↔UPF 交互时间线（见“本地联调”，只需 python3）
 go.mod / go.sum
 README.md
 ```
@@ -267,6 +268,33 @@ go run ./main -config main/conf/cp-test.yaml
 # 或一键跑冒烟脚本（OAM 下发 → 定向补偿 → 下线删除 → 批量同步全流程）
 bash smoke_test.sh
 ```
+
+### UPF 走 http 还是 https（一键切换）
+
+UPF 客户端的协议由 `upf.baseURL` 的 scheme 决定，改一行即切换：调试用
+`http://127.0.0.1:18153`（mock），联调用 `https://10.216.4.160:8153`。
+TLS 配置在 `upf.tls`（仿 jxtx https 客户端，Transport + TLSClientConfig）：
+`insecureSkipVerify: true` 跳过证书校验（自签证书联调用；生产不要开），
+`caFile` 配 UPF 的 CA 证书（PEM），为空用系统根证书；CA 文件打不开启动直接报错。
+baseURL 用 https 时启动会在日志里记一行 `upf https client configured`
+（带 insecureSkipVerify/caFile），确认当前走的是哪种模式。
+
+### 抓包看 CP↔UPF 交互流程
+
+```bash
+# 终端 0：先起抓包（mock 是 HTTP 明文；只抓三个 TCP 端口就够了）
+sudo tcpdump -i lo -s 0 -w /tmp/cp-upf.pcap 'tcp port 18153 or tcp port 18080 or tcp port 10001'
+# 终端 1：跑 smoke_test.sh，跑完 Ctrl-C 停抓包
+./pcap-flow.py /tmp/cp-upf.pcap            # 按时间线打印每一次请求/响应 + 按接口统计
+./pcap-flow.py --bodies /tmp/cp-upf.pcap   # 再打印回调/OAM 请求的 body（只需 python3，不用装 tshark）
+```
+
+时间线里的方向：`CP -> UPF` 是 CP 主动调 UPF（token/ping/dnnlist/sessions/subscribe），
+`UPF -> CP (callback)` 是 UPF 推 UE 上下线，`OAM -> CP` 是 OAM 下发配置。
+token 请求 URI 里的 pwd 会打码，token 响应体不打印。
+注意：CP→UP 走 UDS，不在 pcap 里，看 `/__mock/up/rules` 和日志；真 UPF 是 HTTPS，
+包是加密的，解密需在启动 CP 前设置 `SSLKEYLOGFILE=/tmp/sslkey.log`，再用
+`tshark -o tls.keylog_file:/tmp/sslkey.log` 解。
 
 联调手工验证（CP 启动后按顺序执行）：
 
