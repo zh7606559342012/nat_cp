@@ -8,9 +8,11 @@
 package controllers
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -45,21 +47,278 @@ type oamRequest struct {
 	ReqArgs json.RawMessage `json:"reqArgs"`
 }
 
-func (s *OAMServer) respond(c *gin.Context, uuid string, code int, msg string, data any) {
-	c.JSON(http.StatusOK, gin.H{"uuid": uuid, "code": code, "message": msg, "data": data})
+// ---------------------------------------------------------------------------
+// 响应信封
+//
+// 所有响应都是三层同构：{uuid, ret, body}，body 内再带一个 ret，
+// 与外层同值。区别只在 body 的形状：
+//
+//	成功（查询） {"uuid":"q1","ret":0,
+//	             "body":{"ret":0,"total":3,"records":[{"id":"vx1",...}]}}
+//	成功（写入） {"uuid":"a1","ret":0,"body":{"ret":0,"msg":"新增成功"}}
+//	失败（任意） {"uuid":"a2","ret":-9,
+//	             "body":{"ret":-9,"msg":"vxlan v1 already exists, ..."}}
+//
+// 关键约定：
+//   - ret：0 成功，-9 失败（与 OAM 脚本约定一致）；外层与 body 内同值。
+//   - 查询成功：body 为 {ret, total, records}，total/records 恒定存在，
+//     空结果给 records: []，不让键消失。
+//   - 写命令成功（add/mod/del/batch）：body 为 {ret, msg}，msg 是中文动作
+//     描述（"新增成功"/"删除成功"）。
+//   - 失败：不分命令类型，body 统一为 {ret:-9, msg:<具体原因>}，
+//     不带 total/records——失败时业务数据没有意义。
+//   - uuid 原样回显，供 OAM 做请求-响应匹配。
+// ---------------------------------------------------------------------------
+
+// retOK / retFail 分别是成功与失败的返回码，外层 body 内外同值。
+const (
+	retOK   = 0
+	retFail = -9
+)
+
+// respBody 是 body 的两种形状之一，由命令类型决定：
+//   - listBody：查询成功，{ret, total, records}
+//   - msgBody ：增删改成功与所有失败，{ret, msg}
+//
+// 两者都整体放进 oamResp.Body，形状由调用方（respondList / respondOK /
+// respondErr）保证，不需要各自的信封类型。
+//
+// listBody 字段都不带 omitempty：必须能稳定拿到 total 与 records，
+// 空结果给 records: [] 而不是让键消失。
+type listBody struct {
+	Ret     int `json:"ret"`
+	Total   int `json:"total"`
+	Records any `json:"records"`
+}
+
+// msgBody 是写命令成功与所有失败的业务体。成功时 msg 是中文动作描述，
+// 失败时是具体原因。
+type msgBody struct {
+	Ret int    `json:"ret"`
+	Msg string `json:"msg"`
+}
+
+// oamResp 是所有 OAM 响应的统一信封：{uuid, ret, body}。
+// Body 用 any 承载，因为 body 只有 listBody / msgBody 两种形状，
+// 由三个 respond* 函数各自填，没必要为两种形状各定义一个字段完全相同的信封。
+type oamResp struct {
+	UUID string `json:"uuid"`
+	Ret  int    `json:"ret"`
+	Body any    `json:"body"`
+}
+
+// operationVerb 按命令名给出中文动作，用于拼 msg（"查询成功"/"新增成功"）。
+func operationVerb(cmd string) string {
+	switch {
+	case strings.HasPrefix(cmd, "batch_add_"):
+		return "批量新增"
+	case strings.HasPrefix(cmd, "batch_del_"):
+		return "批量删除"
+	case strings.HasPrefix(cmd, "list_"):
+		return "查询"
+	case strings.HasPrefix(cmd, "add_"):
+		return "新增"
+	case strings.HasPrefix(cmd, "mod_"):
+		return "修改"
+	case strings.HasPrefix(cmd, "del_"):
+		return "删除"
+	default:
+		return "操作"
+	}
+}
+
+// respondErr 输出失败响应：外层 ret=-9，body 内同样是 {ret:-9, msg}，
+// 具体原因进 msg。查询失败与写命令失败共用这一种形状。
+func (s *OAMServer) respondErr(c *gin.Context, uuid, cmd string, err error) {
+	c.PureJSON(http.StatusOK, oamResp{
+		UUID: uuid,
+		Ret:  retFail,
+		Body: msgBody{Ret: retFail, Msg: err.Error()},
+	})
+}
+
+// respondOK 输出写命令的成功响应：body 为 {ret:0, msg:"新增成功"}。
+func (s *OAMServer) respondOK(c *gin.Context, uuid, cmd string) {
+	c.PureJSON(http.StatusOK, oamResp{
+		UUID: uuid,
+		Ret:  retOK,
+		Body: msgBody{Ret: retOK, Msg: operationVerb(cmd) + "成功"},
+	})
+}
+
+// pageResult 是 list_* 命令的返回体：items 进 records，total 为其总数。
+// records 始终是数组（无数据时为 []），客户端不需要再判 null。
+type pageResult struct {
+	Items any
+	Total int
+}
+
+// parsePage 解析 list_* 的 reqArgs 分页参数，支持三种写法：
+//
+//	不传 / null / {} / []          → 全量返回
+//	[0, 10]                        → 下标 0 起取 10 条（OAM 侧约定写法）
+//	{"offset":0,"limit":10}        → 同上，limit 也接受别名 count
+//
+// limit 为 0 表示不限条数（等价于不传）。
+func parsePage(args json.RawMessage) (models.Page, error) {
+	var p models.Page
+	body := bytes.TrimSpace(args)
+	if len(body) == 0 {
+		return p, nil
+	}
+	switch body[0] {
+	case 'n':
+		if !bytes.Equal(body, []byte("null")) {
+			return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+		}
+		return p, nil
+	case '[':
+		// 空数组 [] 交给下面的 Unmarshal，长度 0 时即全量。
+		var arr []int
+		if err := json.Unmarshal(body, &arr); err != nil {
+			return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+		}
+		if len(arr) > 2 {
+			return p, fmt.Errorf("invalid list args %s: expect [offset, limit], got %d elements", body, len(arr))
+		}
+		if len(arr) > 0 {
+			p.Offset = arr[0]
+		}
+		if len(arr) > 1 {
+			p.Limit = arr[1]
+		}
+	case '{':
+		var o struct {
+			Offset *int `json:"offset"`
+			Limit  *int `json:"limit"`
+			Count  *int `json:"count"`
+		}
+		if err := json.Unmarshal(body, &o); err != nil {
+			return p, fmt.Errorf("invalid list args %s: expect {\"offset\":n,\"limit\":m}", body)
+		}
+		if o.Offset != nil {
+			p.Offset = *o.Offset
+		}
+		if o.Limit != nil {
+			p.Limit = *o.Limit
+		}
+		if o.Count != nil {
+			p.Limit = *o.Count
+		}
+	default:
+		return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+	}
+	if err := p.Validate(); err != nil {
+		return p, err
+	}
+	return p, nil
+}
+
+// parseIDArg 解析 del_* 的单个 id，两种写法都接受：
+//
+//	reqArgs = [11]          数组
+//	reqArgs = {"id": 11}    对象
+//
+// id 是 OAM 主键，一定是数字，直接按 uint32 解析，不做字符串兼容。
+func parseIDArg(args json.RawMessage, cmd string) (uint32, error) {
+	body := bytes.TrimSpace(args)
+	if len(body) == 0 || bytes.Equal(body, []byte("null")) {
+		return 0, fmt.Errorf(`%s: reqArgs is required, expect [id] or {"id":...}`, cmd)
+	}
+
+	switch body[0] {
+	case '[':
+		var arr []uint32
+		if err := json.Unmarshal(body, &arr); err != nil {
+			return 0, fmt.Errorf(`%s: reqArgs must be an array with one uint32 id, got %s`, cmd, body)
+		}
+		if len(arr) != 1 {
+			return 0, fmt.Errorf("%s: reqArgs must contain exactly 1 element (the id), got %d", cmd, len(arr))
+		}
+		if arr[0] == 0 {
+			return 0, fmt.Errorf("%s: id must be greater than 0", cmd)
+		}
+		return arr[0], nil
+
+	case '{':
+		// 只取 id，多余字段忽略（OAM 可能顺带带上其它上下文）。
+		var obj struct {
+			ID uint32 `json:"id"`
+		}
+		if err := json.Unmarshal(body, &obj); err != nil {
+			return 0, fmt.Errorf(`%s: reqArgs.id must be a uint32 number (0..4294967295), got %s`, cmd, body)
+		}
+		if obj.ID == 0 {
+			return 0, fmt.Errorf(`%s: reqArgs.id is required, got %s`, cmd, body)
+		}
+		return obj.ID, nil
+
+	default:
+		return 0, fmt.Errorf(`%s: reqArgs must be [id] or {"id":...}, got %s`, cmd, body)
+	}
+}
+
+// flexStr 是业务标识（imsi / fttrbId）的入参类型。
+//
+// 这两个字段 OAM 可能发字符串也可能发数字（15 位 imsi 用 JS 拼 JSON 极易退化成
+// number），统一收成字符串后再入模型。主键 id 不走这里——它是 uint32。
+type flexStr string
+
+func (f *flexStr) UnmarshalJSON(b []byte) error {
+	b = bytes.TrimSpace(b)
+	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
+		*f = ""
+		return nil
+	}
+	if b[0] == '"' {
+		var v string
+		if err := json.Unmarshal(b, &v); err != nil {
+			return fmt.Errorf("expect string or number, got %s", b)
+		}
+		*f = flexStr(v)
+		return nil
+	}
+	var n json.Number
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("expect string or number, got %s", b)
+	}
+	*f = flexStr(n.String())
+	return nil
+}
+
+// paged 是 list_* 分支的公共实现：解析分页参数 → 查询 → 组装 pageResult。
+func paged[T any](args json.RawMessage, fn func(models.Page) ([]T, int, error)) (any, error) {
+	p, err := parsePage(args)
+	if err != nil {
+		return nil, err
+	}
+	items, total, err := fn(p)
+	if err != nil {
+		return nil, err
+	}
+	// nil slice 直接序列化会变成 null；records 语义是数组，统一成 []。
+	if items == nil {
+		items = make([]T, 0)
+	}
+	return pageResult{Items: items, Total: total}, nil
 }
 
 func (s *OAMServer) HandleCall(c *gin.Context) {
 	var req oamRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		s.respond(c, "", 400, "bad json: "+err.Error(), nil)
+		s.respondErr(c, "", req.Command, fmt.Errorf("bad json: %w", err))
 		return
 	}
 	oldSnap := s.snap.Load()
 	ev, data, err := s.dispatch(c, req)
 	if err != nil {
 		s.log.WithError(err).WithField("command", req.Command).Warn("oam command failed")
-		s.respond(c, req.UUID, 400, err.Error(), nil)
+		s.respondErr(c, req.UUID, req.Command, err)
+		return
+	}
+	// 查询类命令（list_*）不改库：不递增版本、不重建快照，直接回数据。
+	if ev == nil {
+		s.respondList(c, req.UUID, req.Command, data)
 		return
 	}
 	// 只有提交成功才允许刷新内存（说明书 10.13 步骤 5）。
@@ -76,24 +335,37 @@ func (s *OAMServer) HandleCall(c *gin.Context) {
 		s.log.WithError(err).Error("rebuild snapshot failed after commit")
 		// 说明书 V1.1 3.9.13：提交成功但快照重建失败，应告警并触发全量 reload。
 		s.startReloadLoop()
-		s.respond(c, req.UUID, 500, "snapshot rebuild failed: "+err.Error(), nil)
+		s.respondErr(c, req.UUID, req.Command, fmt.Errorf("snapshot rebuild failed: %w", err))
 		return
 	}
 	s.snap.Store(newSnap)
-	if ev != nil {
-		ev.Version = version
-		ev.NewDNNs = newlyAppearedDNNs(oldSnap, newSnap)
-		select {
-		case s.engine.Events() <- *ev:
-		default:
-			// 通道满时不再丢弃事件：起 goroutine 等位投递，保证配置提交后
-			// 事件必达（说明书 V1.1 3.4.2）；Go 按 FIFO 唤醒阻塞的发送方，顺序不受影响。
-			s.log.Warn("config event channel full, delivering asynchronously")
-			evCopy := *ev
-			go func() { s.engine.Events() <- evCopy }()
-		}
+	ev.Version = version
+	ev.NewDNNs = newlyAppearedDNNs(oldSnap, newSnap)
+	select {
+	case s.engine.Events() <- *ev:
+	default:
+		// 通道满时不再丢弃事件：起 goroutine 等位投递，保证配置提交后
+		// 事件必达（说明书 V1.1 3.4.2）；Go 按 FIFO 唤醒阻塞的发送方，顺序不受影响。
+		s.log.Warn("config event channel full, delivering asynchronously")
+		evCopy := *ev
+		go func() { s.engine.Events() <- evCopy }()
 	}
-	s.respond(c, req.UUID, 0, "OK", data)
+	s.respondOK(c, req.UUID, req.Command)
+}
+
+// respondList 输出 list_* 的成功响应：{uuid, ret, body:{ret,total,records}}。
+func (s *OAMServer) respondList(c *gin.Context, uuid, cmd string, data any) {
+	pr, ok := data.(pageResult)
+	if !ok {
+		// 理论上不会发生：list_* 分支都返回 pageResult。
+		s.respondErr(c, uuid, cmd, fmt.Errorf("internal error: list command returned unexpected payload"))
+		return
+	}
+	c.PureJSON(http.StatusOK, oamResp{
+		UUID: uuid,
+		Ret:  retOK,
+		Body: listBody{Ret: retOK, Total: pr.Total, Records: pr.Items},
+	})
 }
 
 // buildSnapshot 从四张静态表读取并构建新 Snapshot。
@@ -187,27 +459,29 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 			return nil, nil, err
 		}
 		cfg := a.toModel()
-		if err := s.repo.ModifyVxlan(cfg); err != nil {
+		// OAM 的 mod 报文不带 vniBegin/vniEnd，ModifyVxlan 会用库中范围补齐后返回，
+		// 事件影响面必须按补齐后的范围算，否则会漏掉该范围内的绑定。
+		eff, err := s.repo.ModifyVxlan(cfg)
+		if err != nil {
 			return nil, nil, err
 		}
-		// 范围已由 ModifyVxlan 保证与库中一致，可直接用下发值定位受影响绑定。
-		return s.eventForVxlanRange("MODIFY", cfg.VNIBegin, cfg.VNIEnd), nil, nil
+		return s.eventForVxlanRange("MODIFY", eff.VNIBegin, eff.VNIEnd), nil, nil
 	case "del_vxlan":
-		var a struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(args, &a); err != nil {
+		id, err := parseIDArg(args, "del_vxlan")
+		if err != nil {
 			return nil, nil, err
 		}
 		// 范围内仍有 ToH 绑定时 DeleteVxlan 拒绝删除并给出提示；
 		// 成功时返回被删配置，用其范围定位受影响会话。
-		cfg, err := s.repo.DeleteVxlan(a.ID)
+		cfg, err := s.repo.DeleteVxlan(id)
 		if err != nil {
 			return nil, nil, err
 		}
 		return s.eventForVxlanRange("DELETE", cfg.VNIBegin, cfg.VNIEnd), nil, nil
 	case "list_vxlan":
-		return nil, mustList(s.repo.ListVxlanConfigs()), nil
+		// 分页写法：reqArgs = [offset, limit]
+		data, err := paged(args, s.repo.ListVxlanConfigsPage)
+		return nil, data, err
 
 	// ---- ToH IMSI 绑定 ----
 	case "add_vxlan_imsi", "mod_vxlan_imsi":
@@ -223,7 +497,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 			op = "MODIFY"
 		}
 		return &webTypes.ConfigChangedEvent{Op: op,
-			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+			Keys: []webTypes.BindingKey{{IMSI: string(a.IMSI), DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
 	case "batch_add_vxlan_imsi":
 		list, err := parseList[models.VxlanImsiBinding](args, "bindings", func(a vxlanBindingArgs) models.VxlanImsiBinding {
 			return a.toModel()
@@ -236,17 +510,19 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		}
 		return eventForBindings("BATCH", listKeysVxlan(list)), nil, nil
 	case "del_vxlan_imsi":
-		var a vxlanBindingArgs
-		if err := json.Unmarshal(args, &a); err != nil {
+		id, err := parseIDArg(args, "del_vxlan_imsi")
+		if err != nil {
 			return nil, nil, err
 		}
-		if err := s.repo.DeleteVxlanBinding(a.IMSI, a.DNN); err != nil {
+		b, err := s.repo.DeleteVxlanBindingByID(id)
+		if err != nil {
 			return nil, nil, err
 		}
 		return &webTypes.ConfigChangedEvent{Op: "DELETE",
-			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+			Keys: []webTypes.BindingKey{{IMSI: b.IMSI, DNN: b.DNN}}, DNNs: []string{b.DNN}}, nil, nil
 	case "list_vxlan_imsi":
-		return nil, mustList(s.repo.ListVxlanBindings()), nil
+		data, err := paged(args, s.repo.ListVxlanBindingsPage)
+		return nil, data, err
 
 	// ---- FTTR-B 配置 ----
 	case "add_fttrb", "mod_fttrb":
@@ -279,24 +555,23 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		}
 		return s.eventForFttrbIDs("BATCH", ids), nil, nil
 	case "del_fttrb":
-		var a struct {
-			ID string `json:"id"`
-		}
-		if err := json.Unmarshal(args, &a); err != nil {
+		id, err := parseIDArg(args, "del_fttrb")
+		if err != nil {
 			return nil, nil, err
 		}
 		var fttrbID string
 		for _, fc := range mustList(s.repo.ListFttrbConfigs()) {
-			if fc.ID == a.ID {
+			if fc.ID == id {
 				fttrbID = fc.FttrbID
 			}
 		}
-		if err := s.repo.DeleteFttrb(a.ID); err != nil {
+		if err := s.repo.DeleteFttrb(id); err != nil {
 			return nil, nil, err
 		}
 		return s.eventForFttrb("DELETE", fttrbID), nil, nil
 	case "list_fttrb":
-		return nil, mustList(s.repo.ListFttrbConfigs()), nil
+		data, err := paged(args, s.repo.ListFttrbConfigsPage)
+		return nil, data, err
 
 	// ---- ToB IMSI 绑定 ----
 	case "add_fttrb_imsi", "mod_fttrb_imsi":
@@ -312,7 +587,7 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 			op = "MODIFY"
 		}
 		return &webTypes.ConfigChangedEvent{Op: op,
-			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+			Keys: []webTypes.BindingKey{{IMSI: string(a.IMSI), DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
 	case "batch_add_fttrb_imsi":
 		list, err := parseList[models.FttrbImsiBinding](args, "bindings", func(a fttrbBindingArgs) models.FttrbImsiBinding {
 			return a.toModel()
@@ -325,17 +600,19 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		}
 		return eventForBindings("BATCH", listKeysFttrb(list)), nil, nil
 	case "del_fttrb_imsi":
-		var a fttrbBindingArgs
-		if err := json.Unmarshal(args, &a); err != nil {
+		id, err := parseIDArg(args, "del_fttrb_imsi")
+		if err != nil {
 			return nil, nil, err
 		}
-		if err := s.repo.DeleteFttrbBinding(a.IMSI, a.DNN); err != nil {
+		b, err := s.repo.DeleteFttrbBindingByID(id)
+		if err != nil {
 			return nil, nil, err
 		}
 		return &webTypes.ConfigChangedEvent{Op: "DELETE",
-			Keys: []webTypes.BindingKey{{IMSI: a.IMSI, DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+			Keys: []webTypes.BindingKey{{IMSI: b.IMSI, DNN: b.DNN}}, DNNs: []string{b.DNN}}, nil, nil
 	case "list_fttrb_imsi":
-		return nil, mustList(s.repo.ListFttrbBindings()), nil
+		data, err := paged(args, s.repo.ListFttrbBindingsPage)
+		return nil, data, err
 	}
 	return nil, nil, fmt.Errorf("unknown command %q", req.Command)
 }
@@ -450,7 +727,7 @@ func mustList[T any](list []T, err error) []T {
 // ---------------------------------------------------------------------------
 
 type vxlanArgs struct {
-	ID               string `json:"id"`
+	ID               uint32 `json:"id"`
 	VNIBegin         uint32 `json:"vniBegin"`
 	VNIEnd           uint32 `json:"vniEnd"`
 	LocalVtepIP      string `json:"localVtepIp"`
@@ -470,33 +747,39 @@ func (a vxlanArgs) toModel() models.VxlanConfig {
 }
 
 type vxlanBindingArgs struct {
-	ID   string `json:"id"`
-	IMSI string `json:"imsi"`
-	DNN  string `json:"dnn"`
-	VNI  uint32 `json:"vni"`
+	ID   uint32  `json:"id"`
+	IMSI flexStr `json:"imsi"`
+	DNN  string  `json:"dnn"`
+	VNI  uint32  `json:"vni"`
 }
 
 func (a vxlanBindingArgs) toModel() models.VxlanImsiBinding {
-	return models.VxlanImsiBinding{ID: a.ID, IMSI: a.IMSI, DNN: a.DNN, VNI: a.VNI}
+	return models.VxlanImsiBinding{
+		ID: a.ID, IMSI: string(a.IMSI), DNN: a.DNN, VNI: a.VNI,
+	}
 }
 
 type fttrbArgs struct {
-	ID         string `json:"id"`
-	FttrbID    string `json:"fttrbId"`
-	SrcNatAddr string `json:"srcNatAddr"`
+	ID         uint32  `json:"id"`
+	FttrbID    flexStr `json:"fttrbId"`
+	SrcNatAddr string  `json:"srcNatAddr"`
 }
 
 func (a fttrbArgs) toModel() models.FttrbConfig {
-	return models.FttrbConfig{ID: a.ID, FttrbID: a.FttrbID, SrcNatAddr: a.SrcNatAddr}
+	return models.FttrbConfig{
+		ID: a.ID, FttrbID: string(a.FttrbID), SrcNatAddr: a.SrcNatAddr,
+	}
 }
 
 type fttrbBindingArgs struct {
-	ID      string `json:"id"`
-	IMSI    string `json:"imsi"`
-	DNN     string `json:"dnn"`
-	FttrbID string `json:"fttrbId"`
+	ID      uint32  `json:"id"`
+	IMSI    flexStr `json:"imsi"`
+	DNN     string  `json:"dnn"`
+	FttrbID flexStr `json:"fttrbId"`
 }
 
 func (a fttrbBindingArgs) toModel() models.FttrbImsiBinding {
-	return models.FttrbImsiBinding{ID: a.ID, IMSI: a.IMSI, DNN: a.DNN, FttrbID: a.FttrbID}
+	return models.FttrbImsiBinding{
+		ID: a.ID, IMSI: string(a.IMSI), DNN: a.DNN, FttrbID: string(a.FttrbID),
+	}
 }

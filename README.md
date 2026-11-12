@@ -257,23 +257,25 @@ bash smoke_test.sh
 ```bash
 # 1. OAM 下发 ToH 配置：VNI 范围 + IMSI 绑定（area1）
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"t1","command":"add_vxlan","reqArgs":{"id":"vx1","vniBegin":100,"vniEnd":199,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.0.0/24"}}'
-# 1.1 修改已有配置：全量下发（缺字段会被拒），但 VNI 范围不可改；
+ '{"uuid":"t1","command":"add_vxlan","reqArgs":{"id":1,"vniBegin":100,"vniEnd":199,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.0.0/24"}}'
+# 1.1 修改已有配置：其余字段全量下发（缺字段会被拒，避免误清空），
+#     vniBegin/vniEnd 可以不带——OAM 的 mod 报文不带这两个字段，CP 会沿用库中
+#     已有范围（范围本就不可变）。只带其中一个会报错，要求两个一起给。
 #     换范围须先 del_vxlan 再 add_vxlan，并重新下发该范围内的绑定；
 #     del_vxlan 仅当该 VNI 范围内已无 imsi 绑定时才成功，否则报错提示先删绑定
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"t1b","command":"mod_vxlan","reqArgs":{"id":"vx1","vniBegin":100,"vniEnd":199,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.9.0/24"}}'
+ '{"uuid":"t1b","command":"mod_vxlan","reqArgs":{"id":1,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.9.0/24"}}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"t2","command":"add_vxlan_imsi","reqArgs":{"id":"b1","imsi":"460001111111111","dnn":"area1","vni":100}}'
+ '{"uuid":"t2","command":"add_vxlan_imsi","reqArgs":{"id":2,"imsi":"460001111111111","dnn":"area1","vni":100}}'
 # 触发 area1 定向全量补偿：mock 中 area1 已在线的 20.20.1.1 应被安装
 sleep 2
 curl -s http://127.0.0.1:18153/__mock/up/rules
 
 # 2. OAM 下发 ToB 配置，触发 area2 定向全量补偿
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"t3","command":"add_fttrb","reqArgs":{"id":"f1","fttrbId":"FTTRB-1","srcNatAddr":"10.10.1.0/24"}}'
+ '{"uuid":"t3","command":"add_fttrb","reqArgs":{"id":3,"fttrbId":"FTTRB-1","srcNatAddr":"10.10.1.0/24"}}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"t4","command":"add_fttrb_imsi","reqArgs":{"id":"b2","imsi":"460002222222222","dnn":"area2","fttrbId":"FTTRB-1"}}'
+ '{"uuid":"t4","command":"add_fttrb_imsi","reqArgs":{"id":4,"imsi":"460002222222222","dnn":"area2","fttrbId":"FTTRB-1"}}'
 sleep 2
 curl -s http://127.0.0.1:18153/__mock/up/rules
 
@@ -286,7 +288,106 @@ curl -s http://127.0.0.1:18153/__mock/up/rules
 # 4. 查看 CP 运行态与手动触发批量同步
 curl -s http://127.0.0.1:18080/debug/state
 curl -s -X POST http://127.0.0.1:18080/debug/snapshot-sync
+
+# 5. 查询列表：四个 list_* 都支持分页
+#    reqArgs 传 [offset, limit]：第一个是下标（0 起），第二个是数量
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"q1","command":"list_vxlan","reqArgs":[0,10]}'
+#    不传 / {} / [] 返回全部；limit=0 表示不限条数；单次最多 1000 条
+#    等价写法：{"offset":0,"limit":10}（limit 也接受别名 count）
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"q2","command":"list_vxlan_imsi","reqArgs":{"offset":0,"limit":10}}'
+#    响应：{"uuid":"q1","ret":0,"body":{"ret":0,"total":23,"records":[...]}}
+#    body.records 始终是数组（无数据时为 []），body.total 为满足条件的总条数；
+#    记录字段名（全部 camelCase，主键是 id）：
+#      vxlan_config        id / vniBegin / vniEnd / localVtepIp / remoteVtepIp /
+#                          localOverlayMac / remoteOverlayMac / srcNatAddr /
+#                          createdAt / updatedAt
+#      vxlan_imsi_binding  id / imsi / dnn / vni / createdAt / updatedAt
+#      fttrb_config        id / fttrbId / srcNatAddr / createdAt / updatedAt
+#      fttrb_imsi_binding  id / imsi / dnn / fttrbId / createdAt / updatedAt
+#    list_vxlan / list_vxlan_imsi / list_fttrb / list_fttrb_imsi 规则一致
+#
+#    id 是 uint32，收发都是 JSON 数字："id":999101。
+#    DB 的 id 列虽然是 TEXT，但 database/sql 会用内置的 ParseUint 完成文本与
+#    数字的互转，落库仍是 '999101'，读出即 uint32，不需要自定义类型。
+
+# 6. 删除：四个 del_* 只传一个 id（uint32），数组与对象两种写法都接受
+#      del_vxlan         [11]   或  {"id": 11}
+#      del_fttrb         [11]
+#      del_vxlan_imsi    [11]
+#      del_fttrb_imsi    [11]
+#    id 必须是 1..4294967295 的数字，字符串形态（"11" / ["11"]）会直接报错；
+#    对象里的键名大小写不敏感（{"ID":...} 也能解析），多余字段会被忽略。
+#    成功响应：{"uuid":"d1","ret":0,"body":{"ret":0,"msg":"删除成功"}}
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"d1","command":"del_vxlan_imsi","reqArgs":[11]}'
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"d2","command":"del_vxlan","reqArgs":{"id":1}}'
 ```
+
+字段类型：`id` 是数字，`imsi` / `fttrbId` 是文本：
+
+```bash
+# id：uint32，必须发 JSON 数字。传 "11" / ["11"] 会报错
+#     （reqArgs.id must be a uint32 number），不做字符串兼容。
+#     入参键名写 "ID" 也能解析（Go 的 encoding/json 匹配字段名大小写不敏感），
+#     但出参一律输出小写 id，请统一按小写收发。
+#
+# imsi / fttrbId：文本字段，但两种形态都收，方便 OAM 直接下发：
+#   {"imsi":"460001111111111"}  与  {"imsi":460001111111111}  等价
+#   {"fttrbId":"F1"}            与  {"fttrbId":123213}        等价
+# 原因：15 位 imsi 用 JS 拼 JSON 极易退化成 number，
+# 若只按 string 接收会报 cannot unmarshal number ... of type string。
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"n1","command":"add_fttrb","reqArgs":{"id":999001,"fttrbId":777888,"srcNatAddr":"10.10.2.0/24"}}'
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"n2","command":"del_fttrb","reqArgs":[999001]}'
+```
+
+### OAM 统一调用 /cp/v1/common/call 的响应信封
+
+所有响应都是**三层同构**：`{uuid, ret, body}`。`ret` 表示成败，`0` 成功、`-9` 失败，
+外层与 `body` 内的 `ret` 同值。区别只在 `body` 的形状——查询装数据，增删改装结果。
+
+```jsonc
+// 查询成功（list_*）：body 里 records 为数据数组，total 为满足条件的总条数
+{"uuid": "q1", "ret": 0,
+ "body": { "ret": 0, "total": 2, "records": [ /* ... */ ] }}
+
+// 增删改成功（add_* / mod_* / del_* / batch_*）：body 只有 ret 和 msg，
+// msg 是中文动作描述
+{"uuid": "a1", "ret": 0,
+ "body": { "ret": 0, "msg": "新增成功" }}
+
+// 失败（查询失败与写命令失败同形）：body 内 ret = -9，原因在 msg，
+// 不带 total / records
+{"uuid": "a2", "ret": -9,
+ "body": { "ret": -9, "msg": "vxlan 1 already exists, use mod_vxlan to modify it" }}
+```
+
+| 字段 | 出现场景 | 含义 |
+|---|---|---|
+| `uuid` | 全部 | 原样回显请求的 `uuid`，供 OAM 做请求-响应匹配 |
+| `ret` | 全部 | `0` 成功，`-9` 失败；与 `body.ret` 同值 |
+| `body` | 全部 | 业务体，形状随命令类型不同，见下 |
+| `body.ret` | 全部 | 同上，与外层 `ret` 一致 |
+| `body.total` | 仅查询成功 | 满足条件的总条数（不受分页影响） |
+| `body.records` | 仅查询成功 | 数据数组，无数据时为 `[]`，不会是 `null` |
+| `body.msg` | 增删改 + 全部失败 | 成功为「新增/修改/删除/批量新增/批量删除 + 成功」；失败为具体原因 |
+
+`body` 只有两种形状：
+
+- 查询成功 → `{ret, total, records}`
+- 增删改成功、所有失败 → `{ret, msg}`
+
+失败时不补 `total` / `records`——失败时业务数据没有意义。
+记录字段与 `reqArgs` 同名（camelCase）。
+传参形态：`add_*` / `mod_*` / `batch_*` 用对象（`{"id":...}`），
+`del_*` 用长度为 1 的数字数组（`[11]`）或对象（`{"id":11}`），
+`list_*` 用分页数组（`[offset, limit]`）。
+注意 `/ue/callback`（UPF 回调）与 `/debug/*` 仍是各自的 `{code, message}` 格式，
+不走这套信封。
 
 ## CP-UP socket 约定（待联调冻结，见说明书第 12 章 Q1）
 

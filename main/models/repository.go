@@ -30,74 +30,153 @@ func (s *Repository) NextVersion() uint64 { return atomic.AddUint64(&s.version, 
 
 // ---------------------------------------------------------------------------
 
-func (s *Repository) ListVxlanConfigs() ([]VxlanConfig, error) {
-	rows, err := s.db.Query(`SELECT id,vni_begin,vni_end,local_vtep_ip,remote_vtep_ip,
-		local_overlay_mac,remote_overlay_mac,src_nat_addr,created_at,updated_at FROM vxlan_config`)
+// Page 是 list_* 命令的分页参数：Offset 为起始下标（0 起），Limit 为条数。
+// Limit <= 0 表示不限条数（只按 Offset 偏移）。
+type Page struct {
+	Offset int
+	Limit  int
+}
+
+// MaxPageSize 是单次查询允许的最大条数，防止一次拉全表把响应撑爆。
+const MaxPageSize = 1000
+
+// Validate 校验分页参数取值。
+func (p Page) Validate() error {
+	if p.Offset < 0 {
+		return fmt.Errorf("offset must be >= 0, got %d", p.Offset)
+	}
+	if p.Limit < 0 {
+		return fmt.Errorf("limit must be >= 0, got %d", p.Limit)
+	}
+	if p.Limit > MaxPageSize {
+		return fmt.Errorf("limit must be <= %d, got %d", MaxPageSize, p.Limit)
+	}
+	return nil
+}
+
+// 四张表的查询语句。统一 ORDER BY created_at, id，保证分页顺序稳定
+// （created_at 写入后不再变，id 唯一，翻页不会错位或重复）。
+const (
+	sqlSelectVxlanConfigs = `SELECT id,vni_begin,vni_end,local_vtep_ip,remote_vtep_ip,
+		local_overlay_mac,remote_overlay_mac,src_nat_addr,created_at,updated_at
+		FROM vxlan_config ORDER BY created_at, id`
+	sqlCountVxlanConfigs = `SELECT COUNT(*) FROM vxlan_config`
+
+	sqlSelectVxlanBindings = `SELECT id,imsi,dnn,vni,created_at,updated_at
+		FROM vxlan_imsi_binding ORDER BY created_at, id`
+	sqlCountVxlanBindings = `SELECT COUNT(*) FROM vxlan_imsi_binding`
+
+	sqlSelectFttrbConfigs = `SELECT id,fttrb_id,src_nat_addr,created_at,updated_at
+		FROM fttrb_config ORDER BY created_at, id`
+	sqlCountFttrbConfigs = `SELECT COUNT(*) FROM fttrb_config`
+
+	sqlSelectFttrbBindings = `SELECT id,imsi,dnn,fttrb_id,created_at,updated_at
+		FROM fttrb_imsi_binding ORDER BY created_at, id`
+	sqlCountFttrbBindings = `SELECT COUNT(*) FROM fttrb_imsi_binding`
+)
+
+// listPaged 执行分页查询，返回当前页 + 总行数。
+// 未分页（Offset 与 Limit 都为 0）时不额外跑 COUNT，直接用行数作为总数。
+func listPaged[T any](db *sql.DB, selectSQL, countSQL string, p Page,
+	scan func(*sql.Rows) (T, error)) ([]T, int, error) {
+	limit := p.Limit
+	if limit <= 0 {
+		limit = -1 // SQLite: LIMIT -1 表示不限制条数
+	}
+	offset := p.Offset
+	if offset < 0 {
+		offset = 0
+	}
+	rows, err := db.Query(selectSQL+" LIMIT ? OFFSET ?", limit, offset)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer rows.Close()
-	var out []VxlanConfig
+	var out []T
 	for rows.Next() {
-		var c VxlanConfig
-		if err := rows.Scan(&c.ID, &c.VNIBegin, &c.VNIEnd, &c.LocalVtepIP, &c.RemoteVtepIP,
-			&c.LocalOverlayMAC, &c.RemoteOverlayMAC, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt); err != nil {
-			return nil, err
+		item, err := scan(rows)
+		if err != nil {
+			return nil, 0, err
 		}
-		out = append(out, c)
+		out = append(out, item)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+	if limit < 0 && offset == 0 {
+		return out, len(out), nil
+	}
+	var total int
+	if err := db.QueryRow(countSQL).Scan(&total); err != nil {
+		return nil, 0, err
+	}
+	return out, total, nil
+}
+
+func scanVxlanConfig(rows *sql.Rows) (VxlanConfig, error) {
+	var c VxlanConfig
+	err := rows.Scan(&c.ID, &c.VNIBegin, &c.VNIEnd, &c.LocalVtepIP, &c.RemoteVtepIP,
+		&c.LocalOverlayMAC, &c.RemoteOverlayMAC, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+func scanVxlanBinding(rows *sql.Rows) (VxlanImsiBinding, error) {
+	var b VxlanImsiBinding
+	err := rows.Scan(&b.ID, &b.IMSI, &b.DNN, &b.VNI, &b.CreatedAt, &b.UpdatedAt)
+	return b, err
+}
+
+func scanFttrbConfig(rows *sql.Rows) (FttrbConfig, error) {
+	var c FttrbConfig
+	err := rows.Scan(&c.ID, &c.FttrbID, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt)
+	return c, err
+}
+
+func scanFttrbBinding(rows *sql.Rows) (FttrbImsiBinding, error) {
+	var b FttrbImsiBinding
+	err := rows.Scan(&b.ID, &b.IMSI, &b.DNN, &b.FttrbID, &b.CreatedAt, &b.UpdatedAt)
+	return b, err
+}
+
+// ListVxlanConfigs 返回全部 VXLAN 配置（快照构建、事件影响面计算使用）。
+func (s *Repository) ListVxlanConfigs() ([]VxlanConfig, error) {
+	out, _, err := listPaged(s.db, sqlSelectVxlanConfigs, sqlCountVxlanConfigs, Page{}, scanVxlanConfig)
+	return out, err
+}
+
+// ListVxlanConfigsPage 按分页参数返回 VXLAN 配置，并给出总行数。
+func (s *Repository) ListVxlanConfigsPage(p Page) ([]VxlanConfig, int, error) {
+	return listPaged(s.db, sqlSelectVxlanConfigs, sqlCountVxlanConfigs, p, scanVxlanConfig)
 }
 
 func (s *Repository) ListVxlanBindings() ([]VxlanImsiBinding, error) {
-	rows, err := s.db.Query(`SELECT id,imsi,dnn,vni,created_at,updated_at FROM vxlan_imsi_binding`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []VxlanImsiBinding
-	for rows.Next() {
-		var b VxlanImsiBinding
-		if err := rows.Scan(&b.ID, &b.IMSI, &b.DNN, &b.VNI, &b.CreatedAt, &b.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
+	out, _, err := listPaged(s.db, sqlSelectVxlanBindings, sqlCountVxlanBindings, Page{}, scanVxlanBinding)
+	return out, err
+}
+
+// ListVxlanBindingsPage 按分页参数返回 ToH 绑定，并给出总行数。
+func (s *Repository) ListVxlanBindingsPage(p Page) ([]VxlanImsiBinding, int, error) {
+	return listPaged(s.db, sqlSelectVxlanBindings, sqlCountVxlanBindings, p, scanVxlanBinding)
 }
 
 func (s *Repository) ListFttrbConfigs() ([]FttrbConfig, error) {
-	rows, err := s.db.Query(`SELECT id,fttrb_id,src_nat_addr,created_at,updated_at FROM fttrb_config`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []FttrbConfig
-	for rows.Next() {
-		var c FttrbConfig
-		if err := rows.Scan(&c.ID, &c.FttrbID, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, c)
-	}
-	return out, rows.Err()
+	out, _, err := listPaged(s.db, sqlSelectFttrbConfigs, sqlCountFttrbConfigs, Page{}, scanFttrbConfig)
+	return out, err
+}
+
+// ListFttrbConfigsPage 按分页参数返回 FTTR-B 配置，并给出总行数。
+func (s *Repository) ListFttrbConfigsPage(p Page) ([]FttrbConfig, int, error) {
+	return listPaged(s.db, sqlSelectFttrbConfigs, sqlCountFttrbConfigs, p, scanFttrbConfig)
 }
 
 func (s *Repository) ListFttrbBindings() ([]FttrbImsiBinding, error) {
-	rows, err := s.db.Query(`SELECT id,imsi,dnn,fttrb_id,created_at,updated_at FROM fttrb_imsi_binding`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []FttrbImsiBinding
-	for rows.Next() {
-		var b FttrbImsiBinding
-		if err := rows.Scan(&b.ID, &b.IMSI, &b.DNN, &b.FttrbID, &b.CreatedAt, &b.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, b)
-	}
-	return out, rows.Err()
+	out, _, err := listPaged(s.db, sqlSelectFttrbBindings, sqlCountFttrbBindings, Page{}, scanFttrbBinding)
+	return out, err
+}
+
+// ListFttrbBindingsPage 按分页参数返回 ToB 绑定，并给出总行数。
+func (s *Repository) ListFttrbBindingsPage(p Page) ([]FttrbImsiBinding, int, error) {
+	return listPaged(s.db, sqlSelectFttrbBindings, sqlCountFttrbBindings, p, scanFttrbBinding)
 }
 
 // 校验
@@ -125,7 +204,7 @@ func validateCIDR(cidr string) error {
 }
 
 func validateVxlanConfig(c VxlanConfig) error {
-	if c.ID == "" {
+	if c.ID == 0 {
 		return fmt.Errorf("vxlan id is required")
 	}
 	// add/mod 都是 OAM 全量下发，空字段视为缺参直接拒绝，避免 mod 把库中值清空。
@@ -142,7 +221,7 @@ func validateVxlanConfig(c VxlanConfig) error {
 		}
 	}
 	if c.VNIBegin == 0 || c.VNIEnd == 0 {
-		return fmt.Errorf("vniBegin and vniEnd are required (add/mod both take the full vxlan config)")
+		return fmt.Errorf("vniBegin and vniEnd are required for add_vxlan")
 	}
 	if c.VNIBegin > 16777215 || c.VNIEnd < c.VNIBegin || c.VNIEnd > 16777215 {
 		return fmt.Errorf("invalid vni range %d-%d", c.VNIBegin, c.VNIEnd)
@@ -161,7 +240,7 @@ func validateVxlanConfig(c VxlanConfig) error {
 }
 
 // checkVxlanOverlap 检查 VNI 区间是否与已有配置重叠（说明书 10.5）。
-func checkVxlanOverlap(tx *sql.Tx, id string, begin, end uint32) error {
+func checkVxlanOverlap(tx *sql.Tx, id uint32, begin, end uint32) error {
 	var cnt int
 	err := tx.QueryRow(`SELECT COUNT(*) FROM vxlan_config
 		WHERE id != ? AND NOT (vni_end < ? OR vni_begin > ?)`, id, begin, end).Scan(&cnt)
@@ -211,7 +290,7 @@ func (s *Repository) AddVxlan(c VxlanConfig) error {
 		return err
 	}
 	if cnt > 0 {
-		return fmt.Errorf("vxlan %s already exists, use mod_vxlan to modify it", c.ID)
+		return fmt.Errorf("vxlan %d already exists, use mod_vxlan to modify it", c.ID)
 	}
 	if err := checkVxlanOverlap(tx, c.ID, c.VNIBegin, c.VNIEnd); err != nil {
 		return err
@@ -229,18 +308,22 @@ func (s *Repository) AddVxlan(c VxlanConfig) error {
 	return tx.Commit()
 }
 
-// ModifyVxlan 修改 VXLAN 范围配置（OAM 全量下发）。
+// ModifyVxlan 修改 VXLAN 范围配置（其余字段由 OAM 全量下发）。
 //
 // 只做修改：id 不存在直接报错，不隐式新建；VNI 范围不可变，下发范围与库中
 // 不一致时报错——换范围需先 del_vxlan 再 add_vxlan，并重新下发该范围内的绑定。
-// 其余字段按全量覆盖，updated_at 刷新。
-func (s *Repository) ModifyVxlan(c VxlanConfig) error {
-	if err := validateVxlanConfig(c); err != nil {
-		return err
+//
+// OAM 的 mod 报文不携带 vniBegin/vniEnd，此时沿用库中已有范围（范围本就不可变，
+// 缺省即等价于“不变”）。只传其中一个视为报文不完整，直接报错，不去猜另一半。
+//
+// 返回生效后的配置（含补齐的 vni 范围），调用方据此定位受影响的绑定与会话。
+func (s *Repository) ModifyVxlan(c VxlanConfig) (VxlanConfig, error) {
+	if c.ID == 0 {
+		return VxlanConfig{}, fmt.Errorf("vxlan id is required")
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return VxlanConfig{}, err
 	}
 	defer tx.Rollback()
 
@@ -248,13 +331,27 @@ func (s *Repository) ModifyVxlan(c VxlanConfig) error {
 	err = tx.QueryRow(`SELECT vni_begin, vni_end FROM vxlan_config WHERE id = ?`, c.ID).
 		Scan(&curBegin, &curEnd)
 	if errors.Is(err, sql.ErrNoRows) {
-		return fmt.Errorf("vxlan %s not found, use add_vxlan to create it", c.ID)
+		return VxlanConfig{}, fmt.Errorf("vxlan %d not found, use add_vxlan to create it", c.ID)
 	}
 	if err != nil {
-		return err
+		return VxlanConfig{}, err
+	}
+
+	// vni 范围不可变且 OAM 不再下发：两个都没带就沿用库中值；
+	// 只带一个说明报文不完整，不能猜另一半，直接报错让人发现。
+	switch {
+	case c.VNIBegin == 0 && c.VNIEnd == 0:
+		c.VNIBegin, c.VNIEnd = curBegin, curEnd
+	case c.VNIBegin == 0 || c.VNIEnd == 0:
+		return VxlanConfig{}, fmt.Errorf("vniBegin and vniEnd must be provided together, "+
+			"or omit both to keep the existing range %d-%d", curBegin, curEnd)
+	}
+
+	if err := validateVxlanConfig(c); err != nil {
+		return VxlanConfig{}, err
 	}
 	if curBegin != c.VNIBegin || curEnd != c.VNIEnd {
-		return fmt.Errorf("vni range of vxlan %s is immutable: existing %d-%d, got %d-%d; "+
+		return VxlanConfig{}, fmt.Errorf("vni range of vxlan %d is immutable: existing %d-%d, got %d-%d; "+
 			"delete it and add a new config instead", c.ID, curBegin, curEnd, c.VNIBegin, c.VNIEnd)
 	}
 
@@ -265,9 +362,12 @@ func (s *Repository) ModifyVxlan(c VxlanConfig) error {
 		c.LocalVtepIP, c.RemoteVtepIP, c.LocalOverlayMAC, c.RemoteOverlayMAC,
 		c.SrcNatAddr, now, c.ID)
 	if err != nil {
-		return err
+		return VxlanConfig{}, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return VxlanConfig{}, err
+	}
+	return c, nil
 }
 
 // DeleteVxlan 按 OAM 配置 ID 删除 VXLAN 范围配置。
@@ -276,7 +376,7 @@ func (s *Repository) ModifyVxlan(c VxlanConfig) error {
 // 在错误信息里带上数量与一条示例，提示先删绑定；没有才真正删除。
 // 返回被删配置，供调用方定位受影响的会话（对齐 FTTR-B 的外键 RESTRICT 语义，
 // 但给出明确原因，不把 SQLite 原始错误抛给 OAM）。
-func (s *Repository) DeleteVxlan(id string) (VxlanConfig, error) {
+func (s *Repository) DeleteVxlan(id uint32) (VxlanConfig, error) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return VxlanConfig{}, err
@@ -290,7 +390,7 @@ func (s *Repository) DeleteVxlan(id string) (VxlanConfig, error) {
 		Scan(&c.ID, &c.VNIBegin, &c.VNIEnd, &c.LocalVtepIP, &c.RemoteVtepIP,
 			&c.LocalOverlayMAC, &c.RemoteOverlayMAC, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
-		return VxlanConfig{}, fmt.Errorf("vxlan %s not found", id)
+		return VxlanConfig{}, fmt.Errorf("vxlan %d not found", id)
 	}
 	if err != nil {
 		return VxlanConfig{}, err
@@ -309,7 +409,7 @@ func (s *Repository) DeleteVxlan(id string) (VxlanConfig, error) {
 			Scan(&imsi, &dnn); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return VxlanConfig{}, err
 		}
-		return VxlanConfig{}, fmt.Errorf("vxlan %s cannot be deleted: %d imsi binding(s) still in vni range %d-%d "+
+		return VxlanConfig{}, fmt.Errorf("vxlan %d cannot be deleted: %d imsi binding(s) still in vni range %d-%d "+
 			"(e.g. imsi %s dnn %q), delete the bindings first", id, cnt, c.VNIBegin, c.VNIEnd, imsi, dnn)
 	}
 
@@ -321,6 +421,10 @@ func (s *Repository) DeleteVxlan(id string) (VxlanConfig, error) {
 
 // UpsertVxlanBinding 新增或修改 ToH IMSI+DNN→VNI 绑定。
 func (s *Repository) UpsertVxlanBinding(b VxlanImsiBinding) error {
+	// id 必填：删除、事件定位都按 id 走，缺 id 无法回指这条绑定。
+	if b.ID == 0 {
+		return fmt.Errorf("binding id is required")
+	}
 	if b.IMSI == "" {
 		return fmt.Errorf("imsi is required")
 	}
@@ -336,9 +440,6 @@ func (s *Repository) UpsertVxlanBinding(b VxlanImsiBinding) error {
 		return err
 	}
 	now := utils.NowMilli()
-	if b.ID == "" {
-		b.ID = b.IMSI + "|" + b.DNN
-	}
 	_, err = tx.Exec(`INSERT INTO vxlan_imsi_binding(id,imsi,dnn,vni,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(imsi,dnn) DO UPDATE SET vni=excluded.vni, updated_at=excluded.updated_at`,
@@ -359,18 +460,14 @@ func (s *Repository) BatchAddVxlanBindings(list []VxlanImsiBinding) error {
 	defer tx.Rollback()
 	now := utils.NowMilli()
 	for _, b := range list {
-		if b.IMSI == "" || b.VNI < 1 || b.VNI > 16777215 {
-			return fmt.Errorf("invalid vxlan binding %+v", b)
+		if b.ID == 0 || b.IMSI == "" || b.VNI < 1 || b.VNI > 16777215 {
+			return fmt.Errorf("invalid vxlan binding %+v: id, imsi and vni are required", b)
 		}
 		if err := checkCrossBindingConflict(tx, "fttrb_imsi_binding", b.IMSI, b.DNN); err != nil {
 			return err
 		}
-		id := b.ID
-		if id == "" {
-			id = b.IMSI + "|" + b.DNN
-		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO vxlan_imsi_binding(id,imsi,dnn,vni,created_at,updated_at)
-			VALUES(?,?,?,?,?,?)`, id, b.IMSI, b.DNN, b.VNI, now, now); err != nil {
+			VALUES(?,?,?,?,?,?)`, b.ID, b.IMSI, b.DNN, b.VNI, now, now); err != nil {
 			return err
 		}
 	}
@@ -383,9 +480,35 @@ func (s *Repository) DeleteVxlanBinding(imsi, dnn string) error {
 	return err
 }
 
+// DeleteVxlanBindingByID 按绑定自身的 id 删除 ToH 绑定，返回被删记录。
+// 之所以返回整条记录：OAM 的 del 命令只传 id，而事件需要 imsi+dnn
+// 才能定位受影响会话，删除前先把它读出来。
+func (s *Repository) DeleteVxlanBindingByID(id uint32) (VxlanImsiBinding, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	defer tx.Rollback()
+
+	var b VxlanImsiBinding
+	err = tx.QueryRow(`SELECT id,imsi,dnn,vni,created_at,updated_at
+		FROM vxlan_imsi_binding WHERE id = ?`, id).
+		Scan(&b.ID, &b.IMSI, &b.DNN, &b.VNI, &b.CreatedAt, &b.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VxlanImsiBinding{}, fmt.Errorf("vxlan imsi binding %d not found", id)
+	}
+	if err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM vxlan_imsi_binding WHERE id = ?`, id); err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	return b, tx.Commit()
+}
+
 // UpsertFttrb 新增或修改 FTTR-B 配置。
 func (s *Repository) UpsertFttrb(c FttrbConfig) error {
-	if c.ID == "" || c.FttrbID == "" {
+	if c.ID == 0 || c.FttrbID == "" {
 		return fmt.Errorf("fttrb id and fttrbId are required")
 	}
 	if err := validateCIDR(c.SrcNatAddr); err != nil {
@@ -419,11 +542,11 @@ func (s *Repository) BatchAddFttrbConfigs(list []FttrbConfig) error {
 	now := utils.NowMilli()
 	seen := make(map[string]bool, len(list))
 	for _, c := range list {
-		if c.ID == "" || c.FttrbID == "" {
+		if c.ID == 0 || c.FttrbID == "" {
 			return fmt.Errorf("invalid fttrb config %+v: id and fttrbId are required", c)
 		}
 		if err := validateCIDR(c.SrcNatAddr); err != nil {
-			return fmt.Errorf("fttrb %s: %w", c.ID, err)
+			return fmt.Errorf("fttrb %d: %w", c.ID, err)
 		}
 		// 批内同一个 fttrbId 出现两次一定是上游生成有误，让整批失败比静默取
 		// 最后一条更容易发现问题。
@@ -446,13 +569,16 @@ func (s *Repository) BatchAddFttrbConfigs(list []FttrbConfig) error {
 // DeleteFttrb 按 OAM 配置 ID 删除 FTTR-B 配置。
 // 注意：fttrb_imsi_binding 对 fttrb_id 有 ON DELETE RESTRICT 外键，
 // 仍有绑定引用时删除会失败，调用方需先删除绑定。
-func (s *Repository) DeleteFttrb(id string) error {
+func (s *Repository) DeleteFttrb(id uint32) error {
 	_, err := s.db.Exec(`DELETE FROM fttrb_config WHERE id = ?`, id)
 	return err
 }
 
 // UpsertFttrbBinding 新增或修改 ToB IMSI+DNN→FTTRB ID 绑定。
 func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
+	if b.ID == 0 {
+		return fmt.Errorf("binding id is required")
+	}
 	if b.IMSI == "" || b.FttrbID == "" {
 		return fmt.Errorf("imsi and fttrbId are required")
 	}
@@ -465,9 +591,6 @@ func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
 		return err
 	}
 	now := utils.NowMilli()
-	if b.ID == "" {
-		b.ID = b.IMSI + "|" + b.DNN
-	}
 	_, err = tx.Exec(`INSERT INTO fttrb_imsi_binding(id,imsi,dnn,fttrb_id,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
 		ON CONFLICT(imsi,dnn) DO UPDATE SET fttrb_id=excluded.fttrb_id, updated_at=excluded.updated_at`,
@@ -487,18 +610,14 @@ func (s *Repository) BatchAddFttrbBindings(list []FttrbImsiBinding) error {
 	defer tx.Rollback()
 	now := utils.NowMilli()
 	for _, b := range list {
-		if b.IMSI == "" || b.FttrbID == "" {
-			return fmt.Errorf("invalid fttrb binding %+v", b)
+		if b.ID == 0 || b.IMSI == "" || b.FttrbID == "" {
+			return fmt.Errorf("invalid fttrb binding %+v: id, imsi and fttrbId are required", b)
 		}
 		if err := checkCrossBindingConflict(tx, "vxlan_imsi_binding", b.IMSI, b.DNN); err != nil {
 			return err
 		}
-		id := b.ID
-		if id == "" {
-			id = b.IMSI + "|" + b.DNN
-		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO fttrb_imsi_binding(id,imsi,dnn,fttrb_id,created_at,updated_at)
-			VALUES(?,?,?,?,?,?)`, id, b.IMSI, b.DNN, b.FttrbID, now, now); err != nil {
+			VALUES(?,?,?,?,?,?)`, b.ID, b.IMSI, b.DNN, b.FttrbID, now, now); err != nil {
 			return err
 		}
 	}
@@ -509,4 +628,29 @@ func (s *Repository) BatchAddFttrbBindings(list []FttrbImsiBinding) error {
 func (s *Repository) DeleteFttrbBinding(imsi, dnn string) error {
 	_, err := s.db.Exec(`DELETE FROM fttrb_imsi_binding WHERE imsi = ? AND dnn = ?`, imsi, dnn)
 	return err
+}
+
+// DeleteFttrbBindingByID 按绑定自身的 id 删除 ToB 绑定，返回被删记录。
+// 与 DeleteVxlanBindingByID 同理：事件需要 imsi+dnn，删前先读。
+func (s *Repository) DeleteFttrbBindingByID(id uint32) (FttrbImsiBinding, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	defer tx.Rollback()
+
+	var b FttrbImsiBinding
+	err = tx.QueryRow(`SELECT id,imsi,dnn,fttrb_id,created_at,updated_at
+		FROM fttrb_imsi_binding WHERE id = ?`, id).
+		Scan(&b.ID, &b.IMSI, &b.DNN, &b.FttrbID, &b.CreatedAt, &b.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FttrbImsiBinding{}, fmt.Errorf("fttrb imsi binding %d not found", id)
+	}
+	if err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	if _, err := tx.Exec(`DELETE FROM fttrb_imsi_binding WHERE id = ?`, id); err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	return b, tx.Commit()
 }
