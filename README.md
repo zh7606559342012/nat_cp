@@ -335,7 +335,7 @@ curl -s http://127.0.0.1:18153/__mock/up/rules
 curl -s http://127.0.0.1:18080/debug/state
 curl -s -X POST http://127.0.0.1:18080/debug/snapshot-sync
 
-# 5. 查询列表：四个 list_* 都支持分页
+# 5. 查询列表：四个 list_* 都支持分页（list_upf 不分页，见第 7 步）
 #    reqArgs 传 [offset, limit]：第一个是下标（0 起），第二个是数量
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"q1","command":"list_vxlan","reqArgs":[0,10]}'
@@ -370,6 +370,22 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"d1","command":"del_vxlan_imsi","reqArgs":[11]}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"d2","command":"del_vxlan","reqArgs":{"id":1}}'
+
+# 7. UPF 链路状态：list_upf
+#    只读命令：不落库、不重建快照、不发配置事件，也不访问 UPF 接口，
+#    所以 UPF 暂时不通也能查到（不会因为对端抖动查不到配置）。
+#    reqArgs 可省略，不分页；返回一条链路记录，字段：
+#      localAddr  本端地址：CP 访问 UPF 时的出口 IP（内核选路得出，不是监听地址）
+#      upfAddr    UPF 地址：upf.baseURL 里的 host
+#      port       端口号：upf.baseURL 里的端口（未写端口时按协议补 80 / 443）
+#      dnns       DNN 列表：当前静态绑定中出现过的 DNN（去重、升序）
+#    没配 UPF 时返回 total=0 / records=[]，不报错。
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"u1","command":"list_upf"}'
+#    {"uuid":"u1","ret":0,"body":{"ret":0,"total":1,"records":[
+#       {"localAddr":"172.16.116.12","upfAddr":"10.216.4.160","port":8153,
+#        "dnns":["area1","area2"]}]}}
+#    没有 UPF：{"uuid":"u1","ret":0,"body":{"ret":0,"total":0,"records":[]}}
 ```
 
 字段类型：`id` 是数字，`imsi` / `fttrbId` 是文本：

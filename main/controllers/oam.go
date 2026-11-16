@@ -33,11 +33,21 @@ type OAMServer struct {
 	log    *logrus.Entry
 
 	reloadRunning atomic.Bool // 后台快照 reload 是否在跑，保证同时只有一个
+
+	// upfBaseURL 是 upf.baseURL 原值，只给 list_upf 回显 UPF 地址与端口；
+	// 这里不持有 UPF 客户端：查询链路状态不需要连 UPF，也不该依赖 UPF 可达。
+	upfBaseURL string
 }
 
-// NewOAMServer 创建 OAM 服务。
-func NewOAMServer(repo *models.Repository, snap *conf.Holder, e *handler.Engine) *OAMServer {
-	return &OAMServer{repo: repo, snap: snap, engine: e, log: logrus.WithField("module", "oam")}
+// NewOAMServer 创建 OAM 服务。upfBaseURL 传 cfg.UPF.BaseURL，供 list_upf 使用。
+func NewOAMServer(repo *models.Repository, snap *conf.Holder, e *handler.Engine, upfBaseURL string) *OAMServer {
+	return &OAMServer{
+		repo:       repo,
+		snap:       snap,
+		engine:     e,
+		log:        logrus.WithField("module", "oam"),
+		upfBaseURL: upfBaseURL,
+	}
 }
 
 // oamRequest 是 OAM 统一调用的请求体。
@@ -441,6 +451,12 @@ func newlyAppearedDNNs(oldSnap, newSnap *conf.Snapshot) []string {
 func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigChangedEvent, any, error) {
 	args := req.ReqArgs
 	switch req.Command {
+	// ---- UPF 链路状态（只读，不落库、不发快照）----
+	// 返回一条链路记录：本端地址、UPF 地址、端口、DNN 列表；
+	// 没配 UPF 时 body 为 {ret:0,total:0,records:[]}，不是报错。
+	case "list_upf":
+		return nil, s.upfLinkStatus(), nil
+
 	// ---- VXLAN 范围配置 ----
 	// add 与 mod 分开：add 只新增（id 已存在报错），mod 只修改且 VNI 范围不可变。
 	case "add_vxlan":

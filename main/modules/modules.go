@@ -74,7 +74,8 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 	// 3. 先启动 Callback 与 OAM 服务，再向 UPF 注册订阅。
 	//    这样订阅建立前回调已可监听，且 OAM 配置接口始终可用。
 	cbSrv := &http.Server{Addr: cfg.Callback.Listen, Handler: server.NewCallbackEngine(eng, cfg.Callback.Path)}
-	oamSrv := &http.Server{Addr: cfg.OAM.Listen, Handler: server.NewOAMEngine(controllers.NewOAMServer(repo, holder, eng), cfg.OAM.Path)}
+	oamSrv := &http.Server{Addr: cfg.OAM.Listen, Handler: server.NewOAMEngine(
+		controllers.NewOAMServer(repo, holder, eng, cfg.UPF.BaseURL), cfg.OAM.Path)}
 	go func() {
 		if err := cbSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.WithError(err).Error("callback server exited")
