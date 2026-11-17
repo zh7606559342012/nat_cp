@@ -335,7 +335,7 @@ curl -s http://127.0.0.1:18153/__mock/up/rules
 curl -s http://127.0.0.1:18080/debug/state
 curl -s -X POST http://127.0.0.1:18080/debug/snapshot-sync
 
-# 5. 查询列表：四个 list_* 都支持分页（list_upf 不分页，见第 7 步）
+# 5. 查询列表：四个 list_* 都支持分页（list_upf、list_imsi 不分页，见第 7、8 步）
 #    reqArgs 传 [offset, limit]：第一个是下标（0 起），第二个是数量
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"q1","command":"list_vxlan","reqArgs":[0,10]}'
@@ -386,6 +386,34 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
 #       {"localAddr":"172.16.116.12","upfAddr":"10.216.4.160","port":8153,
 #        "dnns":["area1","area2"]}]}}
 #    没有 UPF：{"uuid":"u1","ret":0,"body":{"ret":0,"total":0,"records":[]}}
+
+# 8. 按 IMSI 查维护信息：list_imsi
+#    只读命令：不落库、不重建快照、不发配置事件，也不访问 UPF/UP 接口，
+#    查的是 CP 内存里的静态绑定与运行态会话/规则，所以对端不通也能查。
+#    reqArgs 传 IMSI，三种写法都行："460001111111111" / ["460001111111111"] /
+#    {"imsi":"460001111111111"}（裸数字也行）；查不到（无绑定也无会话）
+#    返回 total=0 / records=[]，不报错；不传或空 IMSI 返回 ret=-9。
+#    一条记录对应一个 (IMSI, DNN, 地址)，字段：
+#      imsi / dnn / address / online
+#      address      UE 地址：会话 SrcIP（privateIpv4 优先）；离线时 ""
+#      online       是否有在网会话
+#      businessType 转发类型：TOH / TOB；无绑定时 ""
+#      vni          ToH 有效；ToB 为 0
+#      fttrbId      ToB 有效；ToH 为 ""
+#      srcNatAddr   转发 NAT 地址池（ToH 取 VXLAN 范围配置，ToB 取 FTTRB 配置）；无绑定时 ""
+#      allocatedIp  UP 已分配的 SNAT IP；未安装时 ""
+#      ruleStatus   NONE（无期望规则）/ PENDING（有期望规则、待安装确认，含 standby）/
+#                   INSTALLED / FAILED / DELETE_PENDING
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"i1","command":"list_imsi","reqArgs":"460001111111111"}'
+#    {"uuid":"i1","ret":0,"body":{"ret":0,"total":1,"records":[
+#       {"imsi":"460001111111111","dnn":"area1","address":"20.20.1.1","online":true,
+#        "businessType":"TOH","vni":100,"fttrbId":"","srcNatAddr":"10.10.0.0/24",
+#        "allocatedIp":"10.10.0.1","ruleStatus":"INSTALLED"}]}}
+#    有绑定、UE 不在线：{"imsi":"460003333333333","dnn":"area1","address":"","online":false,
+#      "businessType":"TOH","vni":101,"fttrbId":"","srcNatAddr":"10.10.0.0/24",
+#      "allocatedIp":"","ruleStatus":"NONE"}
+#    查不到：{"uuid":"i1","ret":0,"body":{"ret":0,"total":0,"records":[]}}
 ```
 
 字段类型：`id` 是数字，`imsi` / `fttrbId` 是文本：

@@ -457,6 +457,13 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 	case "list_upf":
 		return nil, s.upfLinkStatus(), nil
 
+	// ---- 按 IMSI 查维护信息（只读，不落库、不发快照）----
+	// 返回该 IMSI 的地址、DNN、转发关系；查不到时 body 为
+	// {ret:0,total:0,records:[]}，不是报错。
+	case "list_imsi":
+		data, err := s.lookupIMSI(args)
+		return nil, data, err
+
 	// ---- VXLAN 范围配置 ----
 	// add 与 mod 分开：add 只新增（id 已存在报错），mod 只修改且 VNI 范围不可变。
 	case "add_vxlan":

@@ -838,6 +838,39 @@ type Stats struct {
 	UpfDNNs   []string                       `json:"upfDnns"`
 }
 
+// IMSISession 是按 IMSI 查询返回的单条会话及其规则状态（值副本，只读）。
+type IMSISession struct {
+	Session   webTypes.UeSession // 会话副本
+	Desired   bool               // 是否存在期望规则
+	Allocated string             // UP 已分配的 SNAT IP（installed 有记录时）
+	Status    string             // installed 状态；无记录时 ""
+}
+
+// LookupIMSI 返回该 IMSI 的全部在网会话及其规则状态。
+// 只读内存快照，不访问 UPF/UP、不改任何状态。
+func (e *Engine) LookupIMSI(imsi string) []IMSISession {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]IMSISession, 0)
+	for _, s := range e.sessions {
+		if s.IMSI != imsi {
+			continue
+		}
+		ent := IMSISession{Session: *s}
+		if rk, ok := e.sessionRules[s.SessionKey()]; ok {
+			if _, hasDesired := e.desired[rk]; hasDesired {
+				ent.Desired = true
+			}
+			if inst, ok := e.installed[rk]; ok {
+				ent.Allocated = inst.AllocatedSrcNatIP
+				ent.Status = inst.Status
+			}
+		}
+		out = append(out, ent)
+	}
+	return out
+}
+
 // Stats 快照运行态。
 func (e *Engine) Stats() Stats {
 	e.mu.Lock()
