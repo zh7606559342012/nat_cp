@@ -204,8 +204,8 @@ func (e *Engine) applySession(ctx context.Context, sess *webTypes.UeSession, ups
 		// 内容未变：不递增版本；若已安装成功则直接幂等返回，
 		// 否则补发一次（覆盖之前失败的安装）。
 		inst, ok := e.installed[rule.Key]
-		e.mu.Unlock()
 		if ok && inst.Status == webTypes.InstalledStatusInstalled && inst.DesiredVersion == old.DesiredVersion {
+			e.mu.Unlock()
 			return nil
 		}
 		rule.DesiredVersion = old.DesiredVersion
