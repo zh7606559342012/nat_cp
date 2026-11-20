@@ -34,7 +34,12 @@ uprules
 echo "== 3. 模拟 UPF 推送 area1 UE 下线 =="
 curl -s -X POST http://127.0.0.1:18153/__mock/trigger -d \
  '{"action":"delete","imsi":"460001111111111","dnn":"area1","msisdn":"13800000001","privateIpv4":"20.20.1.1"}'; echo
-sleep 2
+# 回调已改为异步（解析正确即回 200，删规则在后台做），这里轮询等删完再往下走，
+# 否则第 4 步的 snapshot-sync 会把还没删掉的规则重新推回去。
+for i in $(seq 1 20); do
+  if ! uprules | grep -q "20.20.1.1"; then break; fi
+  sleep 0.5
+done
 echo "-- UP rules after delete (expect only 20.20.2.1 TOB):"
 uprules
 

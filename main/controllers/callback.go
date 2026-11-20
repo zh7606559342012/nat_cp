@@ -5,6 +5,7 @@
 package controllers
 
 import (
+	"context"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -15,8 +16,16 @@ import (
 )
 
 // CallbackHandler 处理 UPF 的 UE create/delete 推送（说明书 5.6）。
-// 响应 200 表示接收成功；400 表示报文无法解析；500 表示内部处理失败
-// （UPF 是否重试取决于网元实现，CP 不假设，见说明书 5.10.6）。
+// 响应语义（2026-11-20 领导要求：对 UPF 和对 UP 的内外分开）：
+//   - 报文解析正确就回 200 OK，表示 CP 已接收；
+//   - 跟 UP 的交互（装规则/删规则）是网关内部的事情，异步进行，不等 UP
+//     回结果再回 200；装不装得上 UPF 不用知道、也不用重推。
+//   - 400 只表示报文无法解析或 action 未知。
+//
+// 异步处理用 context.Background()，与 HTTP 请求解耦：UPF（经中继）断开
+// 推送连接不再取消正在进行的 UP 下发。处理失败只记日志，可通过
+// /debug/state（desired 与 installed 对比）与 rule installed/deleted
+// 日志核对。
 func CallbackHandler(e *handler.Engine) gin.HandlerFunc {
 	log := logrus.WithField("module", "callback")
 	return func(c *gin.Context) {
@@ -30,17 +39,18 @@ func CallbackHandler(e *handler.Engine) gin.HandlerFunc {
 		sess.Source = "CALLBACK"
 		switch sess.Action {
 		case webTypes.SessionCreate:
-			if err := e.ApplySession(c.Request.Context(), &sess); err != nil {
-				log.WithError(err).Error("callback apply create failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
-				return
-			}
+			// 异步处理：先回 200，装规则在后台做。
+			go func() {
+				if err := e.ApplySession(context.Background(), &sess); err != nil {
+					log.WithError(err).WithFields(logrus.Fields{"imsi": sess.IMSI, "dnn": sess.DNN}).Error("callback apply create failed")
+				}
+			}()
 		case webTypes.SessionDelete:
-			if err := e.RemoveSession(c.Request.Context(), sess.IMSI, sess.DNN, sess.SrcIP); err != nil {
-				log.WithError(err).Error("callback apply delete failed")
-				c.JSON(http.StatusInternalServerError, gin.H{"code": 500, "message": err.Error()})
-				return
-			}
+			// 异步处理：先回 200，删规则在后台做。
+			// RemoveSession 本身恒返回 nil，失败由内部按会话记日志。
+			go func() {
+				_ = e.RemoveSession(context.Background(), sess.IMSI, sess.DNN, sess.SrcIP)
+			}()
 		default:
 			log.WithField("action", sess.Action).Warn("callback unknown action")
 			c.JSON(http.StatusBadRequest, gin.H{"code": 400, "message": "unknown action"})

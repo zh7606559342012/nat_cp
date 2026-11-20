@@ -143,6 +143,8 @@ logrotate：每天、保留 10 份、单份 20M、copytruncate，与 jxtx 的 ag
 - 订阅成功：`upf subscribe ok`；心跳成功（每 `pingIntervalSec` 一行）：
   `upf ping ok`；链路恢复：`upf link recovered`。
 - 收到 UPF 推送并回复 200：`callback ok`（带 action/imsi/dnn）；
+  （2026-11-20 起：报文解析正确即回 200，跟 UP 的装规则/删规则异步在后台做，
+  装不装得上只记日志、不影响 200；核对装删结果看 `rule installed` / `rule deleted`。）
   启动快照完成：`initial snapshot sync done`（`desiredRules=0` 表示未生成 SNAT 表）。
 - 启动从库加载配置（建联之前）：`initial snapshot loaded from db`
   （configuredDNNs/vxlanRanges/fttrbConfigs/bindings）。
