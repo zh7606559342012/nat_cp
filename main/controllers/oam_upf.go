@@ -11,34 +11,61 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"natcp/main/models"
 )
 
 // upfLink 是 list_upf 的一条记录，字段名与其它 list_* 一致用小驼峰。
 type upfLink struct {
+	// ID 是记录序号，从 1 开始，按整张列表里的位置编号（不受 offset 影响），
+	// 只是给 OAM 一个稳定可引用的下标，不落库、不是主键。
+	ID        int      `json:"id"`
 	LocalAddr string   `json:"localAddr"` // 本端地址：CP 访问 UPF 时的出口 IP
 	UPFAddr   string   `json:"upfAddr"`   // UPF 地址：upf.baseURL 里的 host
 	Port      int      `json:"port"`      // 端口号：upf.baseURL 里的端口
 	DNNs      []string `json:"dnns"`      // DNN 列表：当前静态绑定中出现过的 DNN
 }
 
-// upfLinkStatus 组装 UPF 链路状态。
+// upfLinkPage 按分页参数返回 UPF 链路记录，语义与其它 list_* 完全一致：
+// reqArgs 是 [pageIndex, pageSize] 或 {"pageIndex":n,"pageSize":m}，页码从 0 开始
+// （pageIndex=0 拿第一页），total 是总条数（不受分页参数影响）。
 //
-// 没配 UPF（upf.baseURL 为空）或地址解析不出 host 时，返回 total=0 / records=[]，
+// 一条 CP 只对接一个 UPF，所以这里最多只有 1 条记录：OAM 传 pageIndex=0 得到
+// 1 条，pageIndex=1 得到空 records 但 total 仍为 1。
+func (s *OAMServer) upfLinkPage(p models.Page) ([]upfLink, int, error) {
+	all := s.upfLinks()
+	total := len(all)
+	if p.Offset >= total {
+		// 下标越界不算错误：与 list_* 一致，返回空数组 + 真实总数。
+		return []upfLink{}, total, nil
+	}
+	rest := all[p.Offset:]
+	if p.Limit > 0 && p.Limit < len(rest) {
+		rest = rest[:p.Limit]
+	}
+	return rest, total, nil
+}
+
+// upfLinks 组装 UPF 链路记录。
+//
+// 没配 UPF（upf.baseURL 为空）或地址解析不出 host 时返回空切片，
 // 而不是报错——OAM 侧按“没有 UPF”处理即可。
-func (s *OAMServer) upfLinkStatus() pageResult {
+func (s *OAMServer) upfLinks() []upfLink {
 	host, port, ok := parseUpfBaseURL(s.upfBaseURL)
 	if !ok {
-		return pageResult{Items: []upfLink{}, Total: 0}
+		return []upfLink{}
 	}
-	return pageResult{
-		Items: []upfLink{{
-			LocalAddr: localAddrToward(host, port),
-			UPFAddr:   host,
-			Port:      port,
-			DNNs:      s.configuredDNNs(),
-		}},
-		Total: 1,
+	links := []upfLink{{
+		LocalAddr: localAddrToward(host, port),
+		UPFAddr:   host,
+		Port:      port,
+		DNNs:      s.configuredDNNs(),
+	}}
+	// 序号按整张列表的位置从 1 开始编，翻页时同一行的 id 不变。
+	for i := range links {
+		links[i].ID = i + 1
 	}
+	return links
 }
 
 // parseUpfBaseURL 把 upf.baseURL 拆成 host 与 port。

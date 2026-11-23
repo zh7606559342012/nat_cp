@@ -253,7 +253,30 @@ func checkVxlanOverlap(tx *sql.Tx, id uint32, begin, end uint32) error {
 	return nil
 }
 
+// checkVniInVxlanRange 确认绑定的 vni 落在某个 vxlan 配置的区间内。
+//
+// 绑定的 vni 最终要归属到一个 VXLAN 配置（buildRule 按 vni 找配置取 vtep 等
+// 参数），区间外的 vni 写进去只会生成不完整规则，所以 add/mod/batch 都先校验。
+func checkVniInVxlanRange(tx *sql.Tx, vni uint32) error {
+	var cnt int
+	err := tx.QueryRow(`SELECT COUNT(*) FROM vxlan_config
+		WHERE vni_begin <= ? AND vni_end >= ?`, vni, vni).Scan(&cnt)
+	if err != nil {
+		return err
+	}
+	if cnt == 0 {
+		return fmt.Errorf("vni %d is not within any vxlan config range, add_vxlan covering it first", vni)
+	}
+	return nil
+}
+
 // checkCrossBindingConflict 检查同一 IMSI+DNN 是否已属于另一业务（说明书 10.8）。
+//
+// 绑定表内部由 UNIQUE(imsi,dnn) 约束兜底，但两张绑定表（vxlan_imsi_binding /
+// fttrb_imsi_binding）之间没有数据库层约束，一条 IMSI 同时挂在 ToH 和 ToB 上
+// 时 ApplySession 只会按 LookupBinding 先查到的那张表出规则，另一条静默失效，
+// 所以这里显式跨表查重。add 的幂等重发（同表同键）走 ON CONFLICT 更新，
+// 不会进入本检查的冲突分支。
 func checkCrossBindingConflict(tx *sql.Tx, otherTable, imsi, dnn string) error {
 	var cnt int
 	err := tx.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM %s WHERE imsi = ? AND dnn = ?`, otherTable), imsi, dnn).Scan(&cnt)
@@ -261,7 +284,106 @@ func checkCrossBindingConflict(tx *sql.Tx, otherTable, imsi, dnn string) error {
 		return err
 	}
 	if cnt > 0 {
-		return fmt.Errorf("imsi %s dnn %s already bound to the other business type", imsi, dnn)
+		return fmt.Errorf("imsi %s dnn %q already belongs to %s binding, it cannot be bound to the other business type as well; delete it from %s first",
+			imsi, dnn, otherTable, otherTable)
+	}
+	return nil
+}
+
+// checkSrcNatAddrConflict 检查 srcNatAddr（转发 NAT 地址池）是否与其它配置重叠。
+//
+// NAT 地址池是设备级资源，VXLAN 与 FTTR-B 的池子在同一个 UP 上转发，两条配置
+// 用同一网段（或一个套在另一个里面，如 10.20.0.1/24 与 10.20.0.0/16）会导致
+// NAT 会话互相抢地址，所以这里跨两张表按“有交集”查重。比较走 ParseCIDR 规范化，
+// 10.10.0.1/24 与 10.10.0.0/24 视为同一个池，不靠字符串比对。
+//
+// selfTable/selfID/selfFttrbID 用于 mod：改自己时不把自己当成冲突源（批量按
+// fttrbId 幂等更新时 id 可能与库里不同，故再按 fttrbID 排除一次）。库里已有的
+// 脏地址（解析不了的）跳过，不因为存量数据挡住新配置。
+func checkSrcNatAddrConflict(tx *sql.Tx, selfTable string, selfID uint32, selfFttrbID, addr string) error {
+	_, want, err := net.ParseCIDR(addr)
+	if err != nil {
+		return fmt.Errorf("invalid cidr %q: %w", addr, err)
+	}
+	// check 返回非 nil 表示命中冲突；自己那一行返回 nil 表示跳过。
+	check := func(label string, id uint32, fttrbID, cur string) error {
+		if label == selfTable && id == selfID {
+			return nil
+		}
+		if label == "fttrb" && selfFttrbID != "" && fttrbID == selfFttrbID {
+			return nil
+		}
+		_, got, err := net.ParseCIDR(cur)
+		if err != nil {
+			return nil // 存量脏数据不参与比较
+		}
+		if !cidrOverlap(want, got) {
+			return nil
+		}
+		return fmt.Errorf("srcNatAddr %s overlaps %s config %d (%s), "+
+			"each nat address pool must be disjoint", want.String(), label, id, got.String())
+	}
+
+	rows, err := tx.Query(`SELECT id, src_nat_addr FROM vxlan_config ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var id uint32
+		var cur string
+		if err := rows.Scan(&id, &cur); err != nil {
+			rows.Close()
+			return err
+		}
+		if err := check("vxlan", id, "", cur); err != nil {
+			rows.Close()
+			return err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	rows, err = tx.Query(`SELECT id, fttrb_id, src_nat_addr FROM fttrb_config ORDER BY id`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uint32
+		var fttrbID, cur string
+		if err := rows.Scan(&id, &fttrbID, &cur); err != nil {
+			return err
+		}
+		if err := check("fttrb", id, fttrbID, cur); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// cidrOverlap 判断两个网段是否有交集。
+//
+// ParseCIDR 给出的 IP 已按掩码对齐，CIDR 块之间的关系只有两种：完全不相交，
+// 或者一个包含另一个，所以只需检查任一方的网络地址是否落在对方网段内。
+// 地址族不同（v4 vs v6）时 Contains 恒为 false，正好符合预期。
+func cidrOverlap(a, b *net.IPNet) bool {
+	return a.Contains(b.IP) || b.Contains(a.IP)
+}
+
+// requireFttrbExists 确认 fttrbId 已存在。
+//
+// 绑定表对 fttrb_id 有外键，但不做前置检查的话，OAM 传错 fttrbId 只能收到
+// SQLite 原文 “FOREIGN KEY constraint failed”，看不出是哪条配置错了。
+func requireFttrbExists(tx *sql.Tx, fttrbID string) error {
+	var cnt int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM fttrb_config WHERE fttrb_id = ?`, fttrbID).Scan(&cnt); err != nil {
+		return err
+	}
+	if cnt == 0 {
+		return fmt.Errorf("fttrb %s not found, add_fttrb it first", fttrbID)
 	}
 	return nil
 }
@@ -293,6 +415,9 @@ func (s *Repository) AddVxlan(c VxlanConfig) error {
 		return fmt.Errorf("vxlan %d already exists, use mod_vxlan to modify it", c.ID)
 	}
 	if err := checkVxlanOverlap(tx, c.ID, c.VNIBegin, c.VNIEnd); err != nil {
+		return err
+	}
+	if err := checkSrcNatAddrConflict(tx, "vxlan", 0, "", c.SrcNatAddr); err != nil {
 		return err
 	}
 
@@ -353,6 +478,10 @@ func (s *Repository) ModifyVxlan(c VxlanConfig) (VxlanConfig, error) {
 	if curBegin != c.VNIBegin || curEnd != c.VNIEnd {
 		return VxlanConfig{}, fmt.Errorf("vni range of vxlan %d is immutable: existing %d-%d, got %d-%d; "+
 			"delete it and add a new config instead", c.ID, curBegin, curEnd, c.VNIBegin, c.VNIEnd)
+	}
+	// 改 srcNatAddr 也要查重：否则两条配置可以指向同一个 NAT 地址池。
+	if err := checkSrcNatAddrConflict(tx, "vxlan", c.ID, "", c.SrcNatAddr); err != nil {
+		return VxlanConfig{}, err
 	}
 
 	now := utils.NowMilli()
@@ -419,7 +548,14 @@ func (s *Repository) DeleteVxlan(id uint32) (VxlanConfig, error) {
 	return c, tx.Commit()
 }
 
-// UpsertVxlanBinding 新增或修改 ToH IMSI+DNN→VNI 绑定。
+// UpsertVxlanBinding 新增 ToH IMSI+DNN→VNI 绑定（add_vxlan_imsi）。
+//
+// 业务键是 (imsi,dnn)：重复下发同一对 (imsi,dnn) 视为幂等重发，只刷新 vni，
+// 保留首次写入的 id（改 id 会与主键冲突，OAM 侧也已按首次的 id 对齐）。
+//
+// 修改已有绑定请走 ModifyVxlanBinding——它按 id 定位，允许改 imsi/dnn；
+// 这里如果 OAM 拿着旧 id 传了新的 (imsi,dnn)，ON CONFLICT(imsi,dnn) 命不中
+// 旧行，插入会直接撞主键（UNIQUE constraint failed: ...id），故先显式拒绝。
 func (s *Repository) UpsertVxlanBinding(b VxlanImsiBinding) error {
 	// id 必填：删除、事件定位都按 id 走，缺 id 无法回指这条绑定。
 	if b.ID == 0 {
@@ -436,18 +572,110 @@ func (s *Repository) UpsertVxlanBinding(b VxlanImsiBinding) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := checkBindingIDFree(tx, "vxlan_imsi_binding", b.ID, b.IMSI, b.DNN, "mod_vxlan_imsi"); err != nil {
+		return err
+	}
+	// vni 必须落在某个 vxlan 配置的区间内，否则生成不了完整规则。
+	if err := checkVniInVxlanRange(tx, b.VNI); err != nil {
+		return err
+	}
+	// 同一 IMSI+DNN 不允许同时挂在 ToH / ToB 两张表上（说明书 10.8）。
 	if err := checkCrossBindingConflict(tx, "fttrb_imsi_binding", b.IMSI, b.DNN); err != nil {
 		return err
 	}
 	now := utils.NowMilli()
 	_, err = tx.Exec(`INSERT INTO vxlan_imsi_binding(id,imsi,dnn,vni,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
-		ON CONFLICT(imsi,dnn) DO UPDATE SET id=excluded.id, vni=excluded.vni, updated_at=excluded.updated_at`,
+		ON CONFLICT(imsi,dnn) DO UPDATE SET vni=excluded.vni, updated_at=excluded.updated_at`,
 		b.ID, b.IMSI, b.DNN, b.VNI, now, now)
 	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// ModifyVxlanBinding 按绑定 id 修改 ToH 绑定（mod_vxlan_imsi），返回修改前的记录。
+//
+// 与 add 分开的原因见 UpsertVxlanBinding：OAM 在编辑页会把 imsi/dnn 一起改，
+// 而 add 的 ON CONFLICT(imsi,dnn) 只在(imsi,dnn) 命中时生效，(imsi,dnn) 一变
+// 就退化成普通 INSERT，同一个 id 再插一次必然撞主键。
+// 返回旧记录是为了让调用方把旧 (imsi,dnn) 的规则也重算掉，否则改绑后旧规则会
+// 一直留到该 UE 下线。
+func (s *Repository) ModifyVxlanBinding(b VxlanImsiBinding) (VxlanImsiBinding, error) {
+	if b.ID == 0 {
+		return VxlanImsiBinding{}, fmt.Errorf("binding id is required")
+	}
+	if b.IMSI == "" {
+		return VxlanImsiBinding{}, fmt.Errorf("imsi is required")
+	}
+	if b.VNI < 1 || b.VNI > 16777215 {
+		return VxlanImsiBinding{}, fmt.Errorf("invalid vni %d", b.VNI)
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	defer tx.Rollback()
+
+	var old VxlanImsiBinding
+	err = tx.QueryRow(`SELECT id,imsi,dnn,vni,created_at,updated_at FROM vxlan_imsi_binding WHERE id = ?`, b.ID).
+		Scan(&old.ID, &old.IMSI, &old.DNN, &old.VNI, &old.CreatedAt, &old.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return VxlanImsiBinding{}, fmt.Errorf("vxlan imsi binding %d not found, use add_vxlan_imsi to create it", b.ID)
+	}
+	if err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	// (imsi,dnn) 被别人占着就不能改过去，否则 UNIQUE(imsi,dnn) 抛 SQLite 原文。
+	var otherID uint32
+	err = tx.QueryRow(`SELECT id FROM vxlan_imsi_binding WHERE imsi = ? AND dnn = ? AND id != ?`,
+		b.IMSI, b.DNN, b.ID).Scan(&otherID)
+	if err == nil {
+		return VxlanImsiBinding{}, fmt.Errorf("imsi %s dnn %q is already bound to vxlan binding %d",
+			b.IMSI, b.DNN, otherID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return VxlanImsiBinding{}, err
+	}
+	// 改出的新 (imsi,dnn) 也不允许落在另一业务（ToB）的绑定表里。
+	if err := checkCrossBindingConflict(tx, "fttrb_imsi_binding", b.IMSI, b.DNN); err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	// 改出的新 vni 同样必须落在某个 vxlan 配置的区间内。
+	if err := checkVniInVxlanRange(tx, b.VNI); err != nil {
+		return VxlanImsiBinding{}, err
+	}
+
+	now := utils.NowMilli()
+	if _, err := tx.Exec(`UPDATE vxlan_imsi_binding SET imsi=?, dnn=?, vni=?, updated_at=? WHERE id=?`,
+		b.IMSI, b.DNN, b.VNI, now, b.ID); err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return VxlanImsiBinding{}, err
+	}
+	return old, nil
+}
+
+// checkBindingIDFree 检查 id 是否已被另一条 (imsi,dnn) 的绑定占用。
+//
+// 占用了就说明调用方本该走 mod_*（按 id 改），走 add_* 只会拿到 SQLite 的
+// “UNIQUE constraint failed: ...id”，看不出是谁占了。
+func checkBindingIDFree(tx *sql.Tx, table string, id uint32, imsi, dnn, modCommand string) error {
+	var curIMSI, curDNN string
+	err := tx.QueryRow(fmt.Sprintf(`SELECT imsi, dnn FROM %s WHERE id = ?`, table), id).
+		Scan(&curIMSI, &curDNN)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if curIMSI == imsi && curDNN == dnn {
+		return nil
+	}
+	return fmt.Errorf("binding %d already belongs to imsi %s dnn %q, use %s to change it",
+		id, curIMSI, curDNN, modCommand)
 }
 
 // BatchAddVxlanBindings 批量新增 ToH 绑定（同一事务；同业务重复键忽略，
@@ -462,6 +690,9 @@ func (s *Repository) BatchAddVxlanBindings(list []VxlanImsiBinding) error {
 	for _, b := range list {
 		if b.ID == 0 || b.IMSI == "" || b.VNI < 1 || b.VNI > 16777215 {
 			return fmt.Errorf("invalid vxlan binding %+v: id, imsi and vni are required", b)
+		}
+		if err := checkVniInVxlanRange(tx, b.VNI); err != nil {
+			return err
 		}
 		if err := checkCrossBindingConflict(tx, "fttrb_imsi_binding", b.IMSI, b.DNN); err != nil {
 			return err
@@ -506,7 +737,11 @@ func (s *Repository) DeleteVxlanBindingByID(id uint32) (VxlanImsiBinding, error)
 	return b, tx.Commit()
 }
 
-// UpsertFttrb 新增或修改 FTTR-B 配置。
+// UpsertFttrb 新增或修改 FTTR-B 配置（add_fttrb / mod_fttrb 共用）。
+//
+// 按 id 定位写入；fttrb_id 是业务唯一键（绑定表外键也指向它），被别的 id 占用
+// 时先拦下来给出可读原因，否则 update 会撞 UNIQUE(fttrb_id) 抛 SQLite 原文。
+// srcNatAddr 是 NAT 地址池，跨 VXLAN / FTTR-B 全局查重。
 func (s *Repository) UpsertFttrb(c FttrbConfig) error {
 	if c.ID == 0 || c.FttrbID == "" {
 		return fmt.Errorf("fttrb id and fttrbId are required")
@@ -514,13 +749,34 @@ func (s *Repository) UpsertFttrb(c FttrbConfig) error {
 	if err := validateCIDR(c.SrcNatAddr); err != nil {
 		return err
 	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	var otherID uint32
+	err = tx.QueryRow(`SELECT id FROM fttrb_config WHERE fttrb_id = ? AND id != ?`, c.FttrbID, c.ID).Scan(&otherID)
+	if err == nil {
+		return fmt.Errorf("fttrbId %s is already used by fttrb config %d", c.FttrbID, otherID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err := checkSrcNatAddrConflict(tx, "fttrb", c.ID, c.FttrbID, c.SrcNatAddr); err != nil {
+		return err
+	}
+
 	now := utils.NowMilli()
-	_, err := s.db.Exec(`INSERT INTO fttrb_config(id,fttrb_id,src_nat_addr,created_at,updated_at)
+	_, err = tx.Exec(`INSERT INTO fttrb_config(id,fttrb_id,src_nat_addr,created_at,updated_at)
 		VALUES(?,?,?,?,?)
 		ON CONFLICT(id) DO UPDATE SET fttrb_id=excluded.fttrb_id,
 		src_nat_addr=excluded.src_nat_addr, updated_at=excluded.updated_at`,
 		c.ID, c.FttrbID, c.SrcNatAddr, now, now)
-	return err
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // BatchAddFttrbConfigs 批量新增 FTTR-B 配置（单事务，全成功或全回滚）。
@@ -555,6 +811,11 @@ func (s *Repository) BatchAddFttrbConfigs(list []FttrbConfig) error {
 		}
 		seen[c.FttrbID] = true
 
+		// 批内已写入的行在同一事务里可见，所以这条检查同时覆盖批内重复与库中重复。
+		if err := checkSrcNatAddrConflict(tx, "fttrb", c.ID, c.FttrbID, c.SrcNatAddr); err != nil {
+			return fmt.Errorf("fttrb %d: %w", c.ID, err)
+		}
+
 		if _, err := tx.Exec(`INSERT INTO fttrb_config(id,fttrb_id,src_nat_addr,created_at,updated_at)
 			VALUES(?,?,?,?,?)
 			ON CONFLICT(fttrb_id) DO UPDATE SET src_nat_addr=excluded.src_nat_addr,
@@ -566,15 +827,62 @@ func (s *Repository) BatchAddFttrbConfigs(list []FttrbConfig) error {
 	return tx.Commit()
 }
 
-// DeleteFttrb 按 OAM 配置 ID 删除 FTTR-B 配置。
-// 注意：fttrb_imsi_binding 对 fttrb_id 有 ON DELETE RESTRICT 外键，
-// 仍有绑定引用时删除会失败，调用方需先删除绑定。
-func (s *Repository) DeleteFttrb(id uint32) error {
-	_, err := s.db.Exec(`DELETE FROM fttrb_config WHERE id = ?`, id)
-	return err
+// DeleteFttrb 按 OAM 配置 ID 删除 FTTR-B 配置，返回被删配置。
+//
+// fttrb_imsi_binding 对 fttrb_id 有 ON DELETE RESTRICT 外键：仍有绑定引用时
+// 直接删只会拿到 SQLite 原文 “FOREIGN KEY constraint failed”，看不出是哪些
+// 绑定挡着，所以这里先查出引用者，给出可读提示（对齐 DeleteVxlan 的做法）。
+// 配置不存在也显式报错，不再假成功。
+func (s *Repository) DeleteFttrb(id uint32) (FttrbConfig, error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FttrbConfig{}, err
+	}
+	defer tx.Rollback()
+
+	var c FttrbConfig
+	err = tx.QueryRow(`SELECT id, fttrb_id, src_nat_addr, created_at, updated_at
+		FROM fttrb_config WHERE id = ?`, id).
+		Scan(&c.ID, &c.FttrbID, &c.SrcNatAddr, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FttrbConfig{}, fmt.Errorf("fttrb config %d not found", id)
+	}
+	if err != nil {
+		return FttrbConfig{}, err
+	}
+
+	// 删除前检查：还有绑定引用这个 fttrbId 就不让删，避免留下悬空绑定。
+	var cnt int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM fttrb_imsi_binding
+		WHERE fttrb_id = ?`, c.FttrbID).Scan(&cnt); err != nil {
+		return FttrbConfig{}, err
+	}
+	if cnt > 0 {
+		// 取一条样例放进错误信息，OAM 侧能直接定位要删的绑定。
+		var imsi, dnn string
+		if err := tx.QueryRow(`SELECT imsi, dnn FROM fttrb_imsi_binding
+			WHERE fttrb_id = ? ORDER BY id LIMIT 1`, c.FttrbID).Scan(&imsi, &dnn); err != nil {
+			return FttrbConfig{}, err
+		}
+		return FttrbConfig{}, fmt.Errorf(
+			"fttrb %s is still referenced by %d imsi binding(s), e.g. imsi %s dnn %q; "+
+				"delete or rebind the bindings first", c.FttrbID, cnt, imsi, dnn)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM fttrb_config WHERE id = ?`, id); err != nil {
+		return FttrbConfig{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FttrbConfig{}, err
+	}
+	return c, nil
 }
 
-// UpsertFttrbBinding 新增或修改 ToB IMSI+DNN→FTTRB ID 绑定。
+// UpsertFttrbBinding 新增 ToB IMSI+DNN→FTTRB ID 绑定（add_fttrb_imsi）。
+//
+// 业务键是 (imsi,dnn)：重复下发同一对 (imsi,dnn) 视为幂等重发，只刷新 fttrb_id，
+// 保留首次写入的 id。要改已有的 imsi/dnn 请走 ModifyFttrbBinding——那条按 id
+// 定位；拿旧 id 传新 (imsi,dnn) 在这里只会撞主键。
 func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
 	if b.ID == 0 {
 		return fmt.Errorf("binding id is required")
@@ -587,13 +895,20 @@ func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
 		return err
 	}
 	defer tx.Rollback()
+	if err := checkBindingIDFree(tx, "fttrb_imsi_binding", b.ID, b.IMSI, b.DNN, "mod_fttrb_imsi"); err != nil {
+		return err
+	}
+	// 同一 IMSI+DNN 不允许同时挂在 ToB / ToH 两张表上（说明书 10.8）。
 	if err := checkCrossBindingConflict(tx, "vxlan_imsi_binding", b.IMSI, b.DNN); err != nil {
+		return err
+	}
+	if err := requireFttrbExists(tx, b.FttrbID); err != nil {
 		return err
 	}
 	now := utils.NowMilli()
 	_, err = tx.Exec(`INSERT INTO fttrb_imsi_binding(id,imsi,dnn,fttrb_id,created_at,updated_at)
 		VALUES(?,?,?,?,?,?)
-		ON CONFLICT(imsi,dnn) DO UPDATE SET id=excluded.id, fttrb_id=excluded.fttrb_id, updated_at=excluded.updated_at`,
+		ON CONFLICT(imsi,dnn) DO UPDATE SET fttrb_id=excluded.fttrb_id, updated_at=excluded.updated_at`,
 		b.ID, b.IMSI, b.DNN, b.FttrbID, now, now)
 	if err != nil {
 		return err
@@ -601,7 +916,65 @@ func (s *Repository) UpsertFttrbBinding(b FttrbImsiBinding) error {
 	return tx.Commit()
 }
 
-// BatchAddFttrbBindings 批量新增 ToB 绑定（同一事务）。
+// ModifyFttrbBinding 按绑定 id 修改 ToB 绑定（mod_fttrb_imsi），返回修改前的记录。
+//
+// OAM 的编辑页会把 imsi / dnn / fttrbId 一起提交，imsi 或 dnn 一变，
+// add 走的 ON CONFLICT(imsi,dnn) 就命不中旧行，退化成普通 INSERT，同一个 id
+// 再插一次必然撞主键（UNIQUE constraint failed: fttrb_imsi_binding.id）。
+// 所以修改必须按 id 定位、就地 UPDATE。
+// 返回旧记录供调用方把旧 (imsi,dnn) 的规则一并重算，避免改绑后旧规则残留。
+func (s *Repository) ModifyFttrbBinding(b FttrbImsiBinding) (FttrbImsiBinding, error) {
+	if b.ID == 0 {
+		return FttrbImsiBinding{}, fmt.Errorf("binding id is required")
+	}
+	if b.IMSI == "" || b.FttrbID == "" {
+		return FttrbImsiBinding{}, fmt.Errorf("imsi and fttrbId are required")
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	defer tx.Rollback()
+
+	var old FttrbImsiBinding
+	err = tx.QueryRow(`SELECT id,imsi,dnn,fttrb_id,created_at,updated_at FROM fttrb_imsi_binding WHERE id = ?`, b.ID).
+		Scan(&old.ID, &old.IMSI, &old.DNN, &old.FttrbID, &old.CreatedAt, &old.UpdatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return FttrbImsiBinding{}, fmt.Errorf("fttrb imsi binding %d not found, use add_fttrb_imsi to create it", b.ID)
+	}
+	if err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	var otherID uint32
+	err = tx.QueryRow(`SELECT id FROM fttrb_imsi_binding WHERE imsi = ? AND dnn = ? AND id != ?`,
+		b.IMSI, b.DNN, b.ID).Scan(&otherID)
+	if err == nil {
+		return FttrbImsiBinding{}, fmt.Errorf("imsi %s dnn %q is already bound to fttrb binding %d",
+			b.IMSI, b.DNN, otherID)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return FttrbImsiBinding{}, err
+	}
+	// 改出的新 (imsi,dnn) 也不允许落在另一业务（ToH）的绑定表里。
+	if err := checkCrossBindingConflict(tx, "vxlan_imsi_binding", b.IMSI, b.DNN); err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	if err := requireFttrbExists(tx, b.FttrbID); err != nil {
+		return FttrbImsiBinding{}, err
+	}
+
+	now := utils.NowMilli()
+	if _, err := tx.Exec(`UPDATE fttrb_imsi_binding SET imsi=?, dnn=?, fttrb_id=?, updated_at=? WHERE id=?`,
+		b.IMSI, b.DNN, b.FttrbID, now, b.ID); err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	if err := tx.Commit(); err != nil {
+		return FttrbImsiBinding{}, err
+	}
+	return old, nil
+}
+
+// BatchAddFttrbBindings 批量新增 ToB 绑定（同一事务；跨业务冲突则整个批次失败回滚）。
 func (s *Repository) BatchAddFttrbBindings(list []FttrbImsiBinding) error {
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -614,6 +987,9 @@ func (s *Repository) BatchAddFttrbBindings(list []FttrbImsiBinding) error {
 			return fmt.Errorf("invalid fttrb binding %+v: id, imsi and fttrbId are required", b)
 		}
 		if err := checkCrossBindingConflict(tx, "vxlan_imsi_binding", b.IMSI, b.DNN); err != nil {
+			return err
+		}
+		if err := requireFttrbExists(tx, b.FttrbID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT OR IGNORE INTO fttrb_imsi_binding(id,imsi,dnn,fttrb_id,created_at,updated_at)

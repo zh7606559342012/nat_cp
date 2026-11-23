@@ -163,13 +163,16 @@ type pageResult struct {
 	Total int
 }
 
-// parsePage 解析 list_* 的 reqArgs 分页参数，支持三种写法：
+// parsePage 解析 list_* 的 reqArgs 分页参数，按 OAM 约定只支持页码语义：
 //
-//	不传 / null / {} / []          → 全量返回
-//	[0, 10]                        → 下标 0 起取 10 条（OAM 侧约定写法）
-//	{"offset":0,"limit":10}        → 同上，limit 也接受别名 count
+//	不传 / null / {} / []    → 全量返回
+//	[pageIndex, pageSize]    → 第 pageIndex 页、每页 pageSize 条，页码从 0 开始
+//	                         （[0,10]=第 0 页，[1,10]=第 1 页即跳过前 10 条）
+//	{"pageIndex":n,"pageSize":m} → 对象写法，语义与数组一致
 //
-// limit 为 0 表示不限条数（等价于不传）。
+// 内部换算 offset = pageIndex * pageSize。pageSize<=0 且 pageIndex>0 时显式报错，
+// 不允许静默退化为全量（那正是分页"失效"的表象）。其余写法一律报错，
+// 避免 OAM 传参笔误（如 page/size）被静默忽略后看起来像"全量"。
 func parsePage(args json.RawMessage) (models.Page, error) {
 	var p models.Page
 	body := bytes.TrimSpace(args)
@@ -179,44 +182,70 @@ func parsePage(args json.RawMessage) (models.Page, error) {
 	switch body[0] {
 	case 'n':
 		if !bytes.Equal(body, []byte("null")) {
-			return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+			return p, fmt.Errorf("invalid list args %s: expect [pageIndex, pageSize]", body)
 		}
 		return p, nil
 	case '[':
 		// 空数组 [] 交给下面的 Unmarshal，长度 0 时即全量。
 		var arr []int
 		if err := json.Unmarshal(body, &arr); err != nil {
-			return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+			return p, fmt.Errorf("invalid list args %s: expect [pageIndex, pageSize]", body)
 		}
 		if len(arr) > 2 {
-			return p, fmt.Errorf("invalid list args %s: expect [offset, limit], got %d elements", body, len(arr))
+			return p, fmt.Errorf("invalid list args %s: expect [pageIndex, pageSize], got %d elements", body, len(arr))
 		}
 		if len(arr) > 0 {
-			p.Offset = arr[0]
-		}
-		if len(arr) > 1 {
-			p.Limit = arr[1]
+			if arr[0] > 0 && (len(arr) < 2 || arr[1] <= 0) {
+				return p, fmt.Errorf("invalid list args %s: pageIndex %d requires a positive pageSize", body, arr[0])
+			}
+			if len(arr) > 1 && arr[1] > 0 {
+				p.Limit = arr[1]
+				p.Offset = arr[0] * arr[1]
+			}
 		}
 	case '{':
+		// 先看键名：只认 pageIndex / pageSize。这样 OAM 传错字段名
+		// （如 page/size/offset）会显式报错，而不是被静默忽略后退化成全量。
+		var keys map[string]json.RawMessage
+		if err := json.Unmarshal(body, &keys); err != nil {
+			return p, fmt.Errorf("invalid list args %s: expect {\"pageIndex\":n,\"pageSize\":m}", body)
+		}
+		for k := range keys {
+			if k != "pageIndex" && k != "pageSize" {
+				return p, fmt.Errorf("invalid list args %s: unknown field %q, expect only pageIndex/pageSize", body, k)
+			}
+		}
+		if len(keys) == 0 {
+			return p, nil // {} → 全量
+		}
 		var o struct {
-			Offset *int `json:"offset"`
-			Limit  *int `json:"limit"`
-			Count  *int `json:"count"`
+			PageIndex *int `json:"pageIndex"`
+			PageSize  *int `json:"pageSize"`
 		}
 		if err := json.Unmarshal(body, &o); err != nil {
-			return p, fmt.Errorf("invalid list args %s: expect {\"offset\":n,\"limit\":m}", body)
+			return p, fmt.Errorf("invalid list args %s: expect {\"pageIndex\":n,\"pageSize\":m}", body)
 		}
-		if o.Offset != nil {
-			p.Offset = *o.Offset
-		}
-		if o.Limit != nil {
-			p.Limit = *o.Limit
-		}
-		if o.Count != nil {
-			p.Limit = *o.Count
+		if o.PageIndex != nil {
+			size := 0
+			if o.PageSize != nil {
+				size = *o.PageSize
+			}
+			if size <= 0 {
+				if *o.PageIndex > 0 {
+					return p, fmt.Errorf("invalid list args %s: pageIndex %d requires a positive pageSize", body, *o.PageIndex)
+				}
+				return p, nil // 页码 0 且无条数 → 全量
+			}
+			p.Limit = size
+			p.Offset = *o.PageIndex * size
+		} else if o.PageSize != nil {
+			// 只传条数没传页码：按第 0 页处理。
+			if *o.PageSize > 0 {
+				p.Limit = *o.PageSize
+			}
 		}
 	default:
-		return p, fmt.Errorf("invalid list args %s: expect [offset, limit]", body)
+		return p, fmt.Errorf("invalid list args %s: expect {\"pageIndex\":n,\"pageSize\":m}", body)
 	}
 	if err := p.Validate(); err != nil {
 		return p, err
@@ -453,9 +482,11 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 	switch req.Command {
 	// ---- UPF 链路状态（只读，不落库、不发快照）----
 	// 返回一条链路记录：本端地址、UPF 地址、端口、DNN 列表；
+	// reqArgs 与 list_* 相同，即 [offset, limit]（"下标 0，取 10 个" 就是 [0,10]）；
 	// 没配 UPF 时 body 为 {ret:0,total:0,records:[]}，不是报错。
 	case "list_upf":
-		return nil, s.upfLinkStatus(), nil
+		data, err := paged(args, s.upfLinkPage)
+		return nil, data, err
 
 	// ---- 按 IMSI 查维护信息（只读，不落库、不发快照）----
 	// 返回该 IMSI 的地址、DNN、转发关系；查不到时 body 为
@@ -507,7 +538,9 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		return nil, data, err
 
 	// ---- ToH IMSI 绑定 ----
-	case "add_vxlan_imsi", "mod_vxlan_imsi":
+	// add 与 mod 分开：add 按 (imsi,dnn) 幂等新增；mod 按 id 定位就地改，
+	// 允许改 imsi/dnn（编辑页就是整体提交的）。
+	case "add_vxlan_imsi":
 		var a vxlanBindingArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, nil, err
@@ -515,12 +548,19 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		if err := s.repo.UpsertVxlanBinding(a.toModel()); err != nil {
 			return nil, nil, err
 		}
-		op := "ADD"
-		if req.Command == "mod_vxlan_imsi" {
-			op = "MODIFY"
-		}
-		return &webTypes.ConfigChangedEvent{Op: op,
+		return &webTypes.ConfigChangedEvent{Op: "ADD",
 			Keys: []webTypes.BindingKey{{IMSI: string(a.IMSI), DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+	case "mod_vxlan_imsi":
+		var a vxlanBindingArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, nil, err
+		}
+		old, err := s.repo.ModifyVxlanBinding(a.toModel())
+		if err != nil {
+			return nil, nil, err
+		}
+		keys, dnns := bindingModifyKeys(old.IMSI, old.DNN, string(a.IMSI), a.DNN)
+		return &webTypes.ConfigChangedEvent{Op: "MODIFY", Keys: keys, DNNs: dnns}, nil, nil
 	case "batch_add_vxlan_imsi":
 		list, err := parseList[models.VxlanImsiBinding](args, "bindings", func(a vxlanBindingArgs) models.VxlanImsiBinding {
 			return a.toModel()
@@ -582,22 +622,20 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		if err != nil {
 			return nil, nil, err
 		}
-		var fttrbID string
-		for _, fc := range mustList(s.repo.ListFttrbConfigs()) {
-			if fc.ID == id {
-				fttrbID = fc.FttrbID
-			}
-		}
-		if err := s.repo.DeleteFttrb(id); err != nil {
+		// DeleteFttrb 返回被删配置（仍有绑定引用时给可读错误并拒绝删除），
+		// 用它的 fttrbId 定位受影响的绑定会话。
+		c, err := s.repo.DeleteFttrb(id)
+		if err != nil {
 			return nil, nil, err
 		}
-		return s.eventForFttrb("DELETE", fttrbID), nil, nil
+		return s.eventForFttrb("DELETE", c.FttrbID), nil, nil
 	case "list_fttrb":
 		data, err := paged(args, s.repo.ListFttrbConfigsPage)
 		return nil, data, err
 
 	// ---- ToB IMSI 绑定 ----
-	case "add_fttrb_imsi", "mod_fttrb_imsi":
+	// 与 ToH 同理：add 按 (imsi,dnn) 幂等新增，mod 按 id 就地改。
+	case "add_fttrb_imsi":
 		var a fttrbBindingArgs
 		if err := json.Unmarshal(args, &a); err != nil {
 			return nil, nil, err
@@ -605,12 +643,19 @@ func (s *OAMServer) dispatch(c *gin.Context, req oamRequest) (*webTypes.ConfigCh
 		if err := s.repo.UpsertFttrbBinding(a.toModel()); err != nil {
 			return nil, nil, err
 		}
-		op := "ADD"
-		if req.Command == "mod_fttrb_imsi" {
-			op = "MODIFY"
-		}
-		return &webTypes.ConfigChangedEvent{Op: op,
+		return &webTypes.ConfigChangedEvent{Op: "ADD",
 			Keys: []webTypes.BindingKey{{IMSI: string(a.IMSI), DNN: a.DNN}}, DNNs: []string{a.DNN}}, nil, nil
+	case "mod_fttrb_imsi":
+		var a fttrbBindingArgs
+		if err := json.Unmarshal(args, &a); err != nil {
+			return nil, nil, err
+		}
+		old, err := s.repo.ModifyFttrbBinding(a.toModel())
+		if err != nil {
+			return nil, nil, err
+		}
+		keys, dnns := bindingModifyKeys(old.IMSI, old.DNN, string(a.IMSI), a.DNN)
+		return &webTypes.ConfigChangedEvent{Op: "MODIFY", Keys: keys, DNNs: dnns}, nil, nil
 	case "batch_add_fttrb_imsi":
 		list, err := parseList[models.FttrbImsiBinding](args, "bindings", func(a fttrbBindingArgs) models.FttrbImsiBinding {
 			return a.toModel()
@@ -692,6 +737,19 @@ func eventForBindings(op string, keys []webTypes.BindingKey) *webTypes.ConfigCha
 		}
 	}
 	return ev
+}
+
+// bindingModifyKeys 返回绑定修改前后的键：imsi/dnn 没变只返回新键，
+// 变了则把旧键一起带上，让引擎把旧键上的会话规则也重算（删掉旧规则）。
+// 否则改绑之后，已在线 UE 的旧转发规则会一直留到它下线。
+func bindingModifyKeys(oldIMSI, oldDNN, newIMSI, newDNN string) ([]webTypes.BindingKey, []string) {
+	keys := []webTypes.BindingKey{{IMSI: newIMSI, DNN: newDNN}}
+	dnns := []string{newDNN}
+	if oldIMSI != newIMSI || oldDNN != newDNN {
+		keys = append(keys, webTypes.BindingKey{IMSI: oldIMSI, DNN: oldDNN})
+		dnns = append(dnns, oldDNN)
+	}
+	return keys, dnns
 }
 
 func listKeysVxlan(list []models.VxlanImsiBinding) []webTypes.BindingKey {

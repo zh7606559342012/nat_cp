@@ -315,6 +315,12 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"t1b","command":"mod_vxlan","reqArgs":{"id":1,"localVtepIp":"172.16.123.100","remoteVtepIp":"10.88.123.100","localOverlayMac":"20:88:10:91:15:22","remoteOverlayMac":"86:1f:ac:b1:79:8a","srcNatAddr":"10.10.9.0/24"}}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"t2","command":"add_vxlan_imsi","reqArgs":{"id":2,"imsi":"460001111111111","dnn":"area1","vni":100}}'
+# 1.2 改绑定走 mod_vxlan_imsi / mod_fttrb_imsi：按 id 定位、就地 UPDATE，
+#     imsi / dnn 可以改（编辑页是整体提交的）。
+#     注意：不要再拿旧 id 走 add_* 去改 imsi/dnn——那条按 (imsi,dnn) 幂等，
+#     (imsi,dnn) 一变就退化成 INSERT，会撞主键；CP 会直接拒绝并提示改用 mod_*。
+curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
+ '{"uuid":"t2b","command":"mod_vxlan_imsi","reqArgs":{"id":2,"imsi":"460001111111112","dnn":"area1","vni":100}}'
 # 触发 area1 定向全量补偿：mock 中 area1 已在线的 20.20.1.1 应被安装
 sleep 2
 curl -s http://127.0.0.1:18153/__mock/up/rules
@@ -337,14 +343,39 @@ curl -s http://127.0.0.1:18153/__mock/up/rules
 curl -s http://127.0.0.1:18080/debug/state
 curl -s -X POST http://127.0.0.1:18080/debug/snapshot-sync
 
+# 4.1 写入约束（违反时 ret=-9，错误信息里带占用方，不会透传 SQLite 原文）
+#   srcNatAddr   转发 NAT 地址池，跨 vxlan_config / fttrb_config 全局互斥：
+#                同一网段被两条配置使用会让 NAT 抢地址，add/mod/batch 都拦。
+#                判定按 CIDR 规范化后是否有交集（一个套在另一个里也算），
+#                10.10.0.1/24 与 10.10.0.0/24 视为同一个池，
+#                10.20.0.1/24 与 10.20.0.0/16 也冲突。
+#   fttrbId      fttrb_config 的业务唯一键（绑定表外键也指向它），不能重复。
+#   vni          vxlan 绑定的 vni 必须落在某个 vxlan 配置的区间内
+#                （add_vxlan_imsi / mod_vxlan_imsi / batch 都校验），否则
+#                buildRule 拿不到 vtep 等参数，生成不了完整规则。
+#   imsi + dnn   各绑定表内 (imsi,dnn) 唯一；同一 IMSI+DNN 也不允许同时挂在
+#                vxlan / fttrb 两个业务的绑定表上（add/mod/batch 都跨表查重），
+#                否则 ApplySession 只按先查到的那张表出规则，另一条静默失效。
+#   例：
+#   {"ret":-9,"msg":"vni 2000 is not within any vxlan config range, add_vxlan covering it first"}
+#   {"ret":-9,"msg":"srcNatAddr 10.20.0.1/24 overlaps fttrb config 1 (10.20.0.0/16),
+#                    each nat address pool must be disjoint"}
+#   {"ret":-9,"msg":"imsi 460030912121002 dnn \"ims2\" is already bound to fttrb binding 1"}
+#   {"ret":-9,"msg":"imsi 460030912121002 dnn \"ims2\" already belongs to fttrb_imsi_binding binding,
+#                    it cannot be bound to the other business type as well; delete it from
+#                    fttrb_imsi_binding first"}
+#   {"ret":-9,"msg":"binding 1 already belongs to imsi ... dnn \"ims2\", use mod_fttrb_imsi to change it"}
+#   {"ret":-9,"msg":"fttrb NOPE not found, add_fttrb it first"}
+#   {"ret":-9,"msg":"fttrb imsi binding 99 not found, use add_fttrb_imsi to create it"}
+
 # 5. 查询列表：四个 list_* 都支持分页（list_upf、list_imsi 不分页，见第 7、8 步）
-#    reqArgs 传 [offset, limit]：第一个是下标（0 起），第二个是数量
+#    reqArgs 按 OAM 约定只支持页码语义，两种写法等价：
+#    [pageIndex, pageSize] 或 {"pageIndex":n,"pageSize":m}，页码从 0 开始，
+#    CP 内部换算 offset = pageIndex*pageSize：[0,10]=第 0 页，[1,10]=第 1 页
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"q1","command":"list_vxlan","reqArgs":[0,10]}'
-#    不传 / {} / [] 返回全部；limit=0 表示不限条数；单次最多 1000 条
-#    等价写法：{"offset":0,"limit":10}（limit 也接受别名 count）
-curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"q2","command":"list_vxlan_imsi","reqArgs":{"offset":0,"limit":10}}'
+ '{"uuid":"q1","command":"list_vxlan","reqArgs":{"pageIndex":0,"pageSize":10}}'
+#    不传 / null / {} / [] 返回全部；pageIndex>0 但 pageSize<=0 会显式报错；
+#    单次最多 1000 条；其余写法（如 page/size/offset）一律报错，不做静默兼容
 #    响应：{"uuid":"q1","ret":0,"body":{"ret":0,"total":23,"records":[...]}}
 #    body.records 始终是数组（无数据时为 []），body.total 为满足条件的总条数；
 #    记录字段名（全部 camelCase，主键是 id）：
@@ -368,6 +399,9 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
 #    id 必须是 1..4294967295 的数字，字符串形态（"11" / ["11"]）会直接报错；
 #    对象里的键名大小写不敏感（{"ID":...} 也能解析），多余字段会被忽略。
 #    成功响应：{"uuid":"d1","ret":0,"body":{"ret":0,"msg":"删除成功"}}
+#    del_vxlan 范围内仍有 imsi 绑定、del_fttrb 仍有绑定引用其 fttrbId 时，
+#    拒绝删除并给出可读提示（带引用计数与一条样例），先删绑定再删配置；
+#    删不存在的 id 显式报 "not found"，不再假成功。
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
  '{"uuid":"d1","command":"del_vxlan_imsi","reqArgs":[11]}'
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
@@ -376,18 +410,25 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
 # 7. UPF 链路状态：list_upf
 #    只读命令：不落库、不重建快照、不发配置事件，也不访问 UPF 接口，
 #    所以 UPF 暂时不通也能查到（不会因为对端抖动查不到配置）。
-#    reqArgs 可省略，不分页；返回一条链路记录，字段：
+#    reqArgs 与其它 list_* 完全一致：[pageIndex, pageSize] 或对象写法，页码 0 起；
+#    不传 / [] / null 返回全部。OAM 传 pageIndex=0 时正常返回这条记录。
+#    返回一条链路记录，字段：
+#      id         序号：从 1 开始（1,2,3...），按整张列表的位置编号，翻页不变，
+#                 仅为方便 OAM 定位/操作，不是主键、不落库
 #      localAddr  本端地址：CP 访问 UPF 时的出口 IP（内核选路得出，不是监听地址）
 #      upfAddr    UPF 地址：upf.baseURL 里的 host
 #      port       端口号：upf.baseURL 里的端口（未写端口时按协议补 80 / 443）
 #      dnns       DNN 列表：当前静态绑定中出现过的 DNN（去重、升序）
+#    CP 只对接一个 UPF，所以最多 1 条记录：total 只会是 0 或 1；
+#    页码越过末尾时返回空 records，total 仍为真实总数，不报错。
 #    没配 UPF 时返回 total=0 / records=[]，不报错。
 curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
- '{"uuid":"u1","command":"list_upf"}'
+ '{"uuid":"u1","command":"list_upf","reqArgs":[0,10]}'
 #    {"uuid":"u1","ret":0,"body":{"ret":0,"total":1,"records":[
-#       {"localAddr":"172.16.116.12","upfAddr":"10.216.4.160","port":8153,
+#       {"id":1,"localAddr":"172.16.116.12","upfAddr":"10.216.4.160","port":8153,
 #        "dnns":["area1","area2"]}]}}
-#    没有 UPF：{"uuid":"u1","ret":0,"body":{"ret":0,"total":0,"records":[]}}
+#    page=1（第 1 页已越过唯一一条）：{"ret":0,"total":1,"records":[]}
+#    没有 UPF：{"ret":0,"total":0,"records":[]}
 
 # 8. 按 IMSI 查维护信息：list_imsi
 #    只读命令：不落库、不重建快照、不发配置事件，也不访问 UPF/UP 接口，
@@ -477,7 +518,7 @@ curl -s -X POST http://127.0.0.1:10001/cp/v1/common/call -d \
 记录字段与 `reqArgs` 同名（camelCase）。
 传参形态：`add_*` / `mod_*` / `batch_*` 用对象（`{"id":...}`），
 `del_*` 用长度为 1 的数字数组（`[11]`）或对象（`{"id":11}`），
-`list_*` 用分页数组（`[offset, limit]`）。
+`list_*` 用分页参数（`{"pageIndex":n,"pageSize":m}` 或 `[n,m]`，页码从 0 起）。
 注意 `/ue/callback`（UPF 回调）与 `/debug/*` 仍是各自的 `{code, message}` 格式，
 不走这套信封。
 
