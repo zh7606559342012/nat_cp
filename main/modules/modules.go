@@ -64,7 +64,7 @@ func Run(ctx context.Context, cfg *conf.Config) error {
 
 	upfCli, err := upf.New(cfg.UPF.BaseURL, cfg.UPF.User, cfg.UPF.PwdMD5,
 		time.Duration(cfg.UPF.TimeoutSec)*time.Second, cfg.UPF.TokenTTLMin, cfg.UPF.TokenRefreshBeforeSec,
-		upf.TLSConfig{InsecureSkipVerify: cfg.UPF.TLS.InsecureSkipVerify, CAFile: cfg.UPF.TLS.CAFile})
+		upf.TLSConfig{InsecureSkipVerify: cfg.UPF.TLS.InsecureSkipVerify, CAFile: cfg.UPF.TLS.CAFile, KeyLogFile: cfg.UPF.TLS.KeyLogFile})
 	if err != nil {
 		return fmt.Errorf("build upf client: %w", err)
 	}

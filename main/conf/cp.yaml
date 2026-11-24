@@ -18,6 +18,7 @@ upf:
   tls:
     insecureSkipVerify: false
     caFile: ""
+    # keyLogFile: "/tmp/sslkey.log"  # TLS 会话密钥日志（NSS key log，抓包解密用）；联调专用，生产不要开
   # CP 提供给 UPF 的回调地址：UPF 用 POST 向该地址推送 UE create/delete。
   # 必须是 UPF 能访问到的地址（含 CP 监听端口与回调路径）。
   callbackURL: http://172.16.123.221:18080/ue/callback

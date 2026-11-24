@@ -83,6 +83,11 @@ type Client struct {
 	refreshBefore time.Duration
 	http      *http.Client
 
+	// keyLogFile 是 TLS 会话密钥日志的句柄（配了 KeyLogFile 时才有），
+	// 进程生命周期内保持打开，永不关闭；tls.Config 只持有 writer，
+	// 句柄必须另存一份，否则文件会在 Client 回收后无法续写。
+	keyLogFile *os.File
+
 	mu     sync.Mutex
 	token  string
 	expiry time.Time
@@ -96,6 +101,10 @@ type Client struct {
 type TLSConfig struct {
 	InsecureSkipVerify bool
 	CAFile             string
+	// KeyLogFile 为 TLS 会话密钥日志文件（NSS key log 格式，抓包解密用，
+	// 如 tshark -o tls.keylog_file:<path>）；为空不记录。文件内容可解密
+	// 全部流量，等同凭证，联调专用，生产不要开。
+	KeyLogFile string
 }
 
 // New 创建 UPF 客户端。baseURL 自带协议：http 调试、https 联调，改一行即切换。
@@ -111,35 +120,50 @@ func New(baseURL, user, pwdMD5 string, timeout time.Duration, ttlMin, refreshBef
 		log:           logrus.WithField("module", "upf"),
 	}
 	if strings.HasPrefix(strings.ToLower(c.baseURL), "https://") {
-		tlsConf, err := buildTLSConfig(tlsCfg)
+		tlsConf, keyLogFile, err := buildTLSConfig(tlsCfg)
 		if err != nil {
 			return nil, err
 		}
+		c.keyLogFile = keyLogFile
 		tr := http.DefaultTransport.(*http.Transport).Clone()
 		tr.TLSClientConfig = tlsConf
 		c.http = &http.Client{Timeout: timeout, Transport: tr}
-		c.log.WithFields(logrus.Fields{"insecureSkipVerify": tlsCfg.InsecureSkipVerify, "caFile": tlsCfg.CAFile}).
-			Info("upf https client configured")
+		fields := logrus.Fields{"insecureSkipVerify": tlsCfg.InsecureSkipVerify, "caFile": tlsCfg.CAFile}
+		if tlsCfg.KeyLogFile != "" {
+			fields["keyLogFile"] = tlsCfg.KeyLogFile
+		}
+		c.log.WithFields(fields).Info("upf https client configured")
 	}
 	return c, nil
 }
 
 // buildTLSConfig 按配置构造 TLS 配置；CA 文件读不到或里面没有证书就报错。
-func buildTLSConfig(cfg TLSConfig) (*tls.Config, error) {
+// KeyLogFile 配了则打开密钥日志文件（追加写，0600），打不开直接返回错误，
+// 不静默丢弃；返回的文件句柄由调用方持有，进程生命周期内保持打开。
+func buildTLSConfig(cfg TLSConfig) (*tls.Config, *os.File, error) {
 	tlsConf := &tls.Config{InsecureSkipVerify: cfg.InsecureSkipVerify}
+	var keyLogFile *os.File
+	if cfg.KeyLogFile != "" {
+		f, err := os.OpenFile(cfg.KeyLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+		if err != nil {
+			return nil, nil, fmt.Errorf("upf tls keyLogFile: %w", err)
+		}
+		tlsConf.KeyLogWriter = f
+		keyLogFile = f
+	}
 	if cfg.CAFile == "" {
-		return tlsConf, nil
+		return tlsConf, keyLogFile, nil
 	}
 	pem, err := os.ReadFile(cfg.CAFile)
 	if err != nil {
-		return nil, fmt.Errorf("upf tls caFile: %w", err)
+		return nil, nil, fmt.Errorf("upf tls caFile: %w", err)
 	}
 	pool := x509.NewCertPool()
 	if !pool.AppendCertsFromPEM(pem) {
-		return nil, fmt.Errorf("upf tls caFile %s: no certificates found", cfg.CAFile)
+		return nil, nil, fmt.Errorf("upf tls caFile %s: no certificates found", cfg.CAFile)
 	}
 	tlsConf.RootCAs = pool
-	return tlsConf, nil
+	return tlsConf, keyLogFile, nil
 }
 
 // GetToken 调用 token 接口。响应体可能是带引号的 JSON 字符串或裸字符串，

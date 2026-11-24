@@ -40,6 +40,10 @@ type Config struct {
 			InsecureSkipVerify bool `yaml:"insecureSkipVerify"`
 			// CAFile 为 UPF 的 CA 证书（PEM 格式）；为空则用系统根证书。
 			CAFile string `yaml:"caFile"`
+			// KeyLogFile 为 TLS 会话密钥日志文件（NSS key log 格式，抓包解密用，
+			// 如 tshark -o tls.keylog_file:<path>）；为空不记录。文件内容可解密
+			// 全部流量，等同凭证，联调专用，生产不要开；路径打不开启动直接报错。
+			KeyLogFile string `yaml:"keyLogFile"`
 		} `yaml:"tls"`
 	} `yaml:"upf"`
 
