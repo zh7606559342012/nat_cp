@@ -21,10 +21,10 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"natcp/main/conf"
-	"natcp/main/webTypes"
 	"natcp/main/up"
 	"natcp/main/upf"
 	"natcp/main/utils"
+	"natcp/main/webTypes"
 )
 
 // Engine 持有全部运行态。Desired/Installed/Session 只放内存，
@@ -37,8 +37,8 @@ type Engine struct {
 	active bool
 
 	mu           sync.Mutex
-	sessions     map[string]*webTypes.UeSession   // sessionKey -> 会话
-	sessionRules map[string]webTypes.RuleKey      // sessionKey -> 规则键
+	sessions     map[string]*webTypes.UeSession // sessionKey -> 会话
+	sessionRules map[string]webTypes.RuleKey    // sessionKey -> 规则键
 	desired      map[webTypes.RuleKey]*webTypes.ForwardRule
 	installed    map[webTypes.RuleKey]*webTypes.InstalledState
 
@@ -495,6 +495,13 @@ func (e *Engine) RefreshUpfDNNs(ctx context.Context) error {
 	return nil
 }
 
+// PingUPF 真实探测 UPF 是否在线（GET /api/upf/v2/ping）。
+// 供 OAM list_upf 做在线判定：不读内存链路标志，直接发一次心跳请求，
+// Ping 成功才算在线。调用方负责用 context 控制超时，避免 OAM 查询被挂死。
+func (e *Engine) PingUPF(ctx context.Context) error {
+	return e.upf.Ping(ctx)
+}
+
 // EffectiveDNNs 计算 Configured ∩ Upf（说明书 5.10.3）。
 func (e *Engine) EffectiveDNNs() []string {
 	configured := e.snap.Load().ConfiguredDNNs()
@@ -666,7 +673,11 @@ func (e *Engine) onConfigChanged(ctx context.Context, ev webTypes.ConfigChangedE
 		for _, k := range ev.Keys {
 			e.RecomputeBinding(ctx, k.IMSI, k.DNN)
 		}
-		for _, dnn := range ev.DNNs {
+		// 只有首次出现本机绑定的 DNN 才触发定向全量补偿（与 MODIFY 一致，
+		// 详见 webTypes.ConfigChangedEvent.NewDNNs 注释）。已配置过的 DNN
+		// 其会话已被订阅覆盖、在内存缓存里，逐条 add 时不必要地全量拉取
+		// 会让 UPF 白白承受 N 次会话列表查询（OAM 批量导入场景实测复现）。
+		for _, dnn := range ev.NewDNNs {
 			e.TriggerCompensation(dnn)
 		}
 	case "MODIFY":
@@ -830,12 +841,12 @@ func (e *Engine) sendSnapshotBatch(ctx context.Context, snapshotID string, batch
 
 // Stats 返回运行态计数与安装结果，供 /debug/state 使用。
 type Stats struct {
-	Sessions  int                            `json:"sessions"`
-	Desired   int                            `json:"desired"`
-	Installed []webTypes.InstalledState         `json:"installed"`
-	LinkDown  bool                           `json:"linkDown"`
-	Active    bool                           `json:"active"`
-	UpfDNNs   []string                       `json:"upfDnns"`
+	Sessions  int                       `json:"sessions"`
+	Desired   int                       `json:"desired"`
+	Installed []webTypes.InstalledState `json:"installed"`
+	LinkDown  bool                      `json:"linkDown"`
+	Active    bool                      `json:"active"`
+	UpfDNNs   []string                  `json:"upfDnns"`
 }
 
 // IMSISession 是按 IMSI 查询返回的单条会话及其规则状态（值副本，只读）。

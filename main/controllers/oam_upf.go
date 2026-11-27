@@ -1,10 +1,13 @@
 // 本文件实现 list_upf：查询 CP 到 UPF 的链路状态。
 //
-// 只读命令：不改库、不重建快照、不发配置事件，也不访问 UPF 网络接口——
-// 所以 UPF 暂时不可达时依然能查到链路信息，OAM 侧不会因为对端抖动而查不到配置。
+// 只读命令：不改库、不重建快照、不发配置事件。
+// 在线判定是真实的：每次查询先向 UPF 发一次 Ping 心跳（GET /api/upf/v2/ping，
+// 3 秒超时），Ping 成功才返回链路记录；Ping 失败视为 UPF 不在线，
+// 返回空列表（total=0），让 OAM 看到的是网元实时状态而不是本地配置的回显。
 package controllers
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"sort"
@@ -48,11 +51,21 @@ func (s *OAMServer) upfLinkPage(p models.Page) ([]upfLink, int, error) {
 
 // upfLinks 组装 UPF 链路记录。
 //
-// 没配 UPF（upf.baseURL 为空）或地址解析不出 host 时返回空切片，
-// 而不是报错——OAM 侧按“没有 UPF”处理即可。
+// 真实在线探测：先 Ping UPF，不通则返回空切片（OAM 按没有 UPF 处理），
+// 在线才组装记录。没配 UPF（upf.baseURL 为空）或地址解析不出 host 时
+// 同样返回空切片——连配置都没有，更谈不上在线。
 func (s *OAMServer) upfLinks() []upfLink {
 	host, port, ok := parseUpfBaseURL(s.upfBaseURL)
 	if !ok {
+		return []upfLink{}
+	}
+	// 心跳探测限时 3 秒：UPF 离线时 OAM 查询最多多等 3 秒，
+	// 不会因为对端不可达把 HTTP 请求挂死（client 自身超时更长）。
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := s.engine.PingUPF(ctx); err != nil {
+		s.log.WithError(err).WithField("upfAddr", host).
+			Info("list_upf: upf ping failed, report as offline")
 		return []upfLink{}
 	}
 	links := []upfLink{{

@@ -29,6 +29,12 @@ func DbConnInit(path string) error {
 	if err != nil {
 		return fmt.Errorf("open sqlite %s: %w", path, err)
 	}
+	// 连接池限到 1：cache=shared 下多连接并发写会产生 SQLite 表级锁
+	// （SQLITE_LOCKED "database table is locked"），busy_timeout 拦不住它，
+	// 20 并发批量导入实测 10000 条挂了 7496 条。限到 1 后并发在 Go 连接池
+	// 层排队，SQLite 内部不再有锁竞争；单条写事务毫秒级，吞吐足够。
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 	if err := db.Ping(); err != nil {
 		db.Close()
 		return fmt.Errorf("ping sqlite %s: %w", path, err)

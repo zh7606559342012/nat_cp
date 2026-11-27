@@ -34,8 +34,8 @@ type OAMServer struct {
 
 	reloadRunning atomic.Bool // 后台快照 reload 是否在跑，保证同时只有一个
 
-	// upfBaseURL 是 upf.baseURL 原值，只给 list_upf 回显 UPF 地址与端口；
-	// 这里不持有 UPF 客户端：查询链路状态不需要连 UPF，也不该依赖 UPF 可达。
+	// upfBaseURL 是 upf.baseURL 原值，给 list_upf 回显 UPF 地址与端口；
+	// UPF 客户端经 engine 间接持有（PingUPF），list_upf 用它做真实在线探测。
 	upfBaseURL string
 }
 
